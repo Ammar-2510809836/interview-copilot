@@ -1,0 +1,26 @@
+# Environment files
+.env
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Database / Logging
+data/chroma_db/
+chroma.sqlite3
+interview_session.log
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# OS generated files
+.DS_Store
+Thumbs.db
