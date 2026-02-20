@@ -4,6 +4,8 @@ import chromadb
 import onnxruntime
 
 import sys
+import re
+import time
 import asyncio
 import logging
 import threading
@@ -43,7 +45,6 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     
     def markdown_to_html(text: str) -> str:
         """Convert LLM markdown output to styled HTML for the QLabel."""
-        import re
         lines = text.split('\n')
         html_lines = []
         in_code_block = False
@@ -156,7 +157,6 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     }
 
     # Track when the interviewer started speaking for max-wait safety valve
-    import time
     interviewer_start_time = None
 
     while True:
@@ -390,8 +390,9 @@ def main():
     llm_client = LLMClient()
     
     # Initialize Queues & Core Engines
-    audio_queue = asyncio.Queue()
-    text_queue = asyncio.Queue()
+    # maxsize caps prevent unbounded memory growth if LLM/processing is slow
+    audio_queue = asyncio.Queue(maxsize=200)
+    text_queue = asyncio.Queue(maxsize=100)
     
     capture_engine = CaptureEngine()
     transcription_engine = TranscriptionEngine()
