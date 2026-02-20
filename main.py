@@ -69,97 +69,102 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     
     def markdown_to_html(text: str) -> str:
         """Convert LLM markdown output to styled HTML for the QLabel."""
-        lines = text.split('\n')
-        html_lines = []
-        in_code_block = False
-        code_lang = ""
-        code_lines = []
+        try:
+            lines = text.split('\n')
+            html_lines = []
+            in_code_block = False
+            code_lang = ""
+            code_lines = []
 
-        for line in lines:
-            # --- Fenced code block handling ---
-            if line.strip().startswith("```"):
-                if not in_code_block:
-                    in_code_block = True
-                    code_lang = line.strip()[3:].strip()
-                    code_lines = []
-                else:
-                    # End of code block — render it
-                    code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
-                    label = f"<span style='color:#aaaaaa; font-size:11px;'>{code_lang}</span><br>" if code_lang else ""
-                    code_font = ui_overlay.CODE_FONT
+            for line in lines:
+                # --- Fenced code block handling ---
+                if line.strip().startswith("```"):
+                    if not in_code_block:
+                        in_code_block = True
+                        code_lang = line.strip()[3:].strip()
+                        code_lines = []
+                    else:
+                        # End of code block — render it
+                        code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+                        label = f"<span style='color:#aaaaaa; font-size:11px;'>{code_lang}</span><br>" if code_lang else ""
+                        code_font = ui_overlay.CODE_FONT
+                        html_lines.append(
+                            f"<div style='background:#0d1117; border-left:3px solid #00fa9a; "
+                            f"border-radius:5px; padding:10px 12px; margin:6px 0; "
+                            f"font-family:\"{code_font}\",Consolas,monospace; "
+                            f"font-size:12.5px; line-height:1.5; color:#c9d1d9;'>"
+                            f"{label}{code_content}</div>"
+                        )
+                        in_code_block = False
+                        code_lang = ""
+                    continue
+
+                if in_code_block:
+                    code_lines.append(line)
+                    continue
+
+                # --- Inline formatting ---
+                line = re.sub(r'\*\*(.+?)\*\*', r"<b style='color:#ffffff;'>\1</b>", line)
+                line = re.sub(r'`([^`]+)`', r"<code style='background:#1a1a2e; color:#00fa9a; font-family:Consolas,monospace; padding:1px 4px; border-radius:3px;'>\1</code>", line)
+
+                # --- Bullet points: • or - at start ---
+                stripped = line.strip()
+                if stripped.startswith("•") or (stripped.startswith("-") and len(stripped) > 2):
+                    content = stripped.lstrip("•- ").strip()
                     html_lines.append(
-                        f"<div style='background:#0d1117; border-left:3px solid #00fa9a; "
-                        f"border-radius:5px; padding:10px 12px; margin:6px 0; "
-                        f"font-family:\"{code_font}\",Consolas,monospace; "
-                        f"font-size:12.5px; line-height:1.5; color:#c9d1d9;'>"
-                        f"{label}{code_content}</div>"
+                        f"<div style='margin:3px 0 3px 8px; color:#cccccc;'>"
+                        f"<span style='color:#00fa9a; font-weight:bold;'>▸</span>&nbsp;{content}</div>"
                     )
-                    in_code_block = False
-                    code_lang = ""
-                continue
+                elif stripped == "":
+                    html_lines.append("<br>")
+                else:
+                    html_lines.append(f"<span style='color:#cccccc;'>{line}</span><br>")
 
-            if in_code_block:
-                code_lines.append(line)
-                continue
-
-            # --- Inline formatting ---
-            # Bold: **text**
-            line = re.sub(r'\*\*(.+?)\*\*', r"<b style='color:#ffffff;'>\1</b>", line)
-            # Inline code: `code`
-            line = re.sub(r'`([^`]+)`', r"<code style='background:#1a1a2e; color:#00fa9a; font-family:Consolas,monospace; padding:1px 4px; border-radius:3px;'>\1</code>", line)
-
-            # --- Bullet points: • or - at start ---
-            stripped = line.strip()
-            if stripped.startswith("•") or (stripped.startswith("-") and len(stripped) > 2):
-                content = stripped.lstrip("•- ").strip()
-                html_lines.append(
-                    f"<div style='margin:3px 0 3px 8px; color:#cccccc;'>"
-                    f"<span style='color:#00fa9a; font-weight:bold;'>▸</span>&nbsp;{content}</div>"
-                )
-            elif stripped == "":
-                html_lines.append("<br>")
-            else:
-                html_lines.append(f"<span style='color:#cccccc;'>{line}</span><br>")
-
-        return "".join(html_lines)
+            return "".join(html_lines)
+        except Exception as e:
+            logger.warning(f"markdown_to_html failed: {e}")
+            return f"<span style='color:#cccccc;'>{text}</span>"
 
     def update_ui():
-        html = ""
+        try:
+            html = ""
 
-        # Render historical Q&A pairs (faded) — oldest first
-        for i, (hist_q, hist_a) in enumerate(qa_history):
-            # Progressively fade older entries: oldest=40%, middle=65%
-            opacity = 0.35 + (i / max(len(qa_history), 1)) * 0.35
-            fade = f"opacity:{opacity:.2f};"
-            advice_html = markdown_to_html(hist_a)
-            html += (
-                f"<div style='{fade} margin-bottom:6px;'>"
-                f"<div style='border-left:2px solid #336644; padding:4px 8px; border-radius:3px;'>"
-                f"<span style='color:#607060; font-size:10px; font-weight:bold;'>PREV QUESTION</span><br>"
-                f"<span style='color:#aaaaaa; font-size:12px;'>{hist_q}</span></div>"
-                f"<div style='padding:4px 8px; color:#888888; font-size:12px;'>{advice_html}</div>"
-                f"</div>"
-                f"<hr style='border:none; border-top:1px solid #2a2a2a; margin:4px 0;'>"
-            )
+            # Render historical Q&A pairs (faded) — oldest first
+            for i, (hist_q, hist_a) in enumerate(qa_history):
+                opacity = 0.35 + (i / max(len(qa_history), 1)) * 0.35
+                fade = f"opacity:{opacity:.2f};"
+                advice_html = markdown_to_html(hist_a)
+                html += (
+                    f"<div style='{fade} margin-bottom:6px;'>"
+                    f"<div style='border-left:2px solid #336644; padding:4px 8px; border-radius:3px;'>"
+                    f"<span style='color:#607060; font-size:10px; font-weight:bold;'>PREV QUESTION</span><br>"
+                    f"<span style='color:#aaaaaa; font-size:12px;'>{hist_q}</span></div>"
+                    f"<div style='padding:4px 8px; color:#888888; font-size:12px;'>{advice_html}</div>"
+                    f"</div>"
+                    f"<hr style='border:none; border-top:1px solid #2a2a2a; margin:4px 0;'>"
+                )
 
-        # Render current active Q&A (full brightness)
-        if last_question:
-            html += (
-                f"<div style='background:#1e2a1e; border-left:3px solid #00fa9a; "
-                f"padding:6px 10px; border-radius:4px; margin-bottom:8px;'>"
-                f"<span style='color:#aaaaaa; font-size:11px; font-weight:bold;'>INTERVIEWER</span><br>"
-                f"<b style='color:#ffffff; font-size:14px;'>{last_question}</b></div>"
-            )
+            # Render current active Q&A (full brightness)
+            if last_question:
+                html += (
+                    f"<div style='background:#1e2a1e; border-left:3px solid #00fa9a; "
+                    f"padding:6px 10px; border-radius:4px; margin-bottom:8px;'>"
+                    f"<span style='color:#aaaaaa; font-size:11px; font-weight:bold;'>INTERVIEWER</span><br>"
+                    f"<b style='color:#ffffff; font-size:14px;'>{last_question}</b></div>"
+                )
 
-        if last_advice:
-            advice_html = markdown_to_html(last_advice)
-            html += (
-                f"<div style='margin-top:4px;'>"
-                f"<span style='color:#00fa9a; font-size:11px; font-weight:bold;'>⚡ COPILOT</span><br>"
-                f"{advice_html}</div>"
-            )
+            if last_advice:
+                advice_html = markdown_to_html(last_advice)
+                html += (
+                    f"<div style='margin-top:4px;'>"
+                    f"<span style='color:#00fa9a; font-size:11px; font-weight:bold;'>⚡ COPILOT</span><br>"
+                    f"{advice_html}</div>"
+                )
 
-        ui_overlay.update_text(html)
+            ui_overlay.update_text(html)
+        except Exception as e:
+            logger.warning(f"update_ui failed: {e}")
+            ui_overlay.update_text("<span style='color:#ff6b6b;'>⚠ UI render error</span>")
 
 
     # Set of words that indicate a sentence is cut off mid-thought
@@ -190,27 +195,29 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
             if manual_trigger_event.is_set():
                 manual_trigger_event.clear()
                 if interviewer_accumulator or transcript_history:
-                    q_text = " ".join(interviewer_accumulator) if interviewer_accumulator else last_question
-                    if not q_text:
-                        # Fallback: scan recent history for last interviewer line
-                        for msg in reversed(transcript_history):
-                            if msg.startswith("[INTERVIEWER]"):
-                                q_text = msg.replace("[INTERVIEWER]: ", "").strip()
-                                break
-                    logger.info(f"Hotkey: Manual trigger fired! Forcing LLM call.")
-                    interviewer_accumulator.clear()
-                    interviewer_start_time = None
-                    last_advice = "<i style='color:#888888'>Copilot Thinking (Manual)...</i>"
-                    update_ui()
-                    context = rag_manager.retrieve_context(q_text)
-                    # Use regen method — it NEVER returns SKIP, always generates an answer
-                    answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=q_text)
-                    answer_clean = answer.strip() if answer else ""
-                    if answer_clean and not answer_clean.startswith("Error"):
-                        session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
-                        last_advice = answer_clean
-                    else:
-                        last_advice = "<i style='color:#888888'>(No answer generated)</i>"
+                    try:
+                        q_text = " ".join(interviewer_accumulator) if interviewer_accumulator else last_question
+                        if not q_text:
+                            for msg in reversed(transcript_history):
+                                if msg.startswith("[INTERVIEWER]"):
+                                    q_text = msg.replace("[INTERVIEWER]: ", "").strip()
+                                    break
+                        logger.info(f"Hotkey: Manual trigger fired! Forcing LLM call.")
+                        interviewer_accumulator.clear()
+                        interviewer_start_time = None
+                        last_advice = "<i style='color:#888888'>Copilot Thinking (Manual)...</i>"
+                        update_ui()
+                        context = rag_manager.retrieve_context(q_text)
+                        answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=q_text)
+                        answer_clean = answer.strip() if answer else ""
+                        if answer_clean and not answer_clean.startswith("Error"):
+                            session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
+                            last_advice = answer_clean
+                        else:
+                            last_advice = "<i style='color:#888888'>(No answer generated)</i>"
+                    except Exception as e:
+                        logger.error(f"Manual trigger failed: {e}")
+                        last_advice = "<i style='color:#ff6b6b'>⚠ Manual trigger error — check logs</i>"
                     update_ui()
 
                 continue
@@ -220,21 +227,25 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
             if regen_trigger_event.is_set():
                 regen_trigger_event.clear()
                 if last_question or transcript_history:
-                    logger.info("Hotkey: Ctrl+R fired! Regenerating last answer...")
-                    last_advice = "<i style='color:#888888'>Regenerating...</i>"
-                    update_ui()
-                    q_text = last_question if last_question else "(use recent conversation context)"
-                    context = rag_manager.retrieve_context(q_text)
-                    answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=last_question)
-                    answer_clean = answer.strip() if answer else ""
-                    if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
-                        session_logger.info(f"[COPILOT ADVICE (REGEN)]:\n{answer_clean}\n" + "="*50)
-                        last_advice = answer_clean
-                        if qa_history:
-                            qa_history[-1] = (last_question, answer_clean)
-                            _save_qa_history()  # Persist to disk
-                    else:
-                        last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
+                    try:
+                        logger.info("Hotkey: Ctrl+R fired! Regenerating last answer...")
+                        last_advice = "<i style='color:#888888'>Regenerating...</i>"
+                        update_ui()
+                        q_text = last_question if last_question else "(use recent conversation context)"
+                        context = rag_manager.retrieve_context(q_text)
+                        answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=last_question)
+                        answer_clean = answer.strip() if answer else ""
+                        if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
+                            session_logger.info(f"[COPILOT ADVICE (REGEN)]:\n{answer_clean}\n" + "="*50)
+                            last_advice = answer_clean
+                            if qa_history:
+                                qa_history[-1] = (last_question, answer_clean)
+                                _save_qa_history()  # Persist to disk
+                        else:
+                            last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
+                    except Exception as e:
+                        logger.error(f"Regen failed: {e}")
+                        last_advice = "<i style='color:#ff6b6b'>⚠ Regeneration error — check logs</i>"
                     update_ui()
                 continue
 
