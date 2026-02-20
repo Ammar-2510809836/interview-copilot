@@ -118,6 +118,48 @@ Portfolio rules:
             logger.error(f"LLM Generation failed: {e}")
             return "Error generating response."
 
+    async def generate_answer_stream(self, transcript_history: list, rag_context: str):
+        """
+        Streaming version of generate_answer.
+        Async generator that yields text chunks as they arrive from the Groq API.
+        Yields '__SKIP__' sentinel string if LLM decides to skip.
+        """
+        if not self.client:
+            yield "Error: Groq API Key missing."
+            return
+
+        recent_history = "\n".join(transcript_history[-15:])
+        recent_lower = recent_history.lower()
+        model, max_tokens = self._route_model(recent_lower)
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": f"Portfolio/Resume Context:\n{rag_context}\n\nRecent Conversation:\n{recent_history}\n\nGenerate your response now. If no [INTERVIEWER] question is present, reply exactly with 'SKIP'."}
+        ]
+
+        try:
+            accumulated = ""
+            stream = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.2,
+                stream=True
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    accumulated += delta
+                    # Early SKIP detection — if first tokens spell SKIP, abort
+                    if len(accumulated) <= 6 and "SKIP" in accumulated.strip():
+                        yield "__SKIP__"
+                        return
+                    yield delta
+
+        except Exception as e:
+            logger.error(f"LLM Stream failed: {e}")
+            yield f"Error streaming response: {e}"
+
     async def generate_answer_regen(self, transcript_history: list, rag_context: str, last_question: str = "") -> str:
         """Same as generate_answer but with higher temperature for a fresh, different take.
         Never returns SKIP — always generates a new answer for the given question."""

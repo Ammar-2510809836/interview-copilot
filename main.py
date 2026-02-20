@@ -317,14 +317,36 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # Fetch RAG
                     context = rag_manager.retrieve_context(q_text)
                     
-                    # Generate Answer
-                    answer = await llm_client.generate_answer(transcript_history, context)
-                    answer_clean = answer.strip() if answer else ""
-                    
-                    if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
+                    # --- STREAMING GENERATION ---
+                    # Show raw plain text while streaming (markdown parsing only at the end)
+                    answer_clean = ""
+                    skipped = False
+                    batch_buffer = ""
+                    BATCH_CHARS = 8
+
+                    async for token in llm_client.generate_answer_stream(transcript_history, context):
+                        if token == "__SKIP__":
+                            skipped = True
+                            break
+                        answer_clean += token
+                        batch_buffer += token
+                        # Update UI with raw text every ~8 chars or at sentence boundaries
+                        if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                            # Show raw text during streaming — fast, no markdown parsing
+                            ui_overlay.update_text(
+                                f"<span style='color:#aaaaaa; font-size:11px; font-weight:bold;'>⚡ COPILOT (streaming...)</span><br>"
+                                f"<span style='color:#cccccc; font-size:14px; font-family:Segoe UI;'>{answer_clean.replace('<','&lt;').replace('>','&gt;')}</span>"
+                            )
+                            batch_buffer = ""
+                            await asyncio.sleep(0.03)  # Give Qt time to repaint
+
+                    if skipped:
+                        logger.info("LLM skipped conversational filler.")
+                        last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
+                    elif answer_clean and not answer_clean.startswith("Error"):
                         logger.info(f"LLM Advice generated.")
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
-                        last_advice = answer_clean
+                        last_advice = answer_clean  # Full markdown render happens in update_ui()
                         # Push completed Q&A to scrollable history (keep last 3)
                         qa_history.append((last_question, answer_clean))
                         if len(qa_history) > 3:
@@ -333,7 +355,8 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         logger.info(f"LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
                         
-                    update_ui()
+                    update_ui()  # Final render with full markdown formatting
+
 
                     
         except asyncio.CancelledError:
