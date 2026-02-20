@@ -1,8 +1,10 @@
 import sys
 import os
-from PyQt6.QtWidgets import QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizeGrip
+from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout,
+                              QLabel, QPushButton, QScrollArea, QSizeGrip,
+                              QSystemTrayIcon, QMenu)
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPoint, QRect
-from PyQt6.QtGui import QFont, QCursor, QFontDatabase
+from PyQt6.QtGui import QFont, QCursor, QFontDatabase, QPixmap, QPainter, QColor, QPolygon, QBrush, QPen, QIcon
 
 class WorkerSignals(QObject):
     """Signals for communicating with the UI thread from async tasks."""
@@ -156,8 +158,81 @@ class UIOverlay(QWidget):
         self.signals = WorkerSignals()
         self.signals.update_text.connect(self._set_text)
         self.show()
+        self._setup_tray()
 
-    # --- Resize Direction Detection ---
+    # --- System Tray ---
+    def _make_tray_icon(self) -> QIcon:
+        """Draw a neon green ⚡ lightning bolt on a dark square — no external image needed."""
+        size = 64
+        px = QPixmap(size, size)
+        px.fill(QColor(20, 20, 20, 255))  # Dark background
+
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Neon green lightning bolt polygon (normalised to 64x64)
+        bolt = QPolygon([
+            QPoint(38,  4),   # top-right
+            QPoint(24, 30),   # middle-left top
+            QPoint(34, 30),   # middle centre
+            QPoint(18, 60),   # bottom-left
+            QPoint(40, 34),   # middle-right bottom
+            QPoint(30, 34),   # middle centre
+            QPoint(44, 10),   # right shoulder
+        ])
+        painter.setBrush(QBrush(QColor(0, 250, 154)))   # #00fa9a neon green
+        painter.setPen(QPen(QColor(0, 200, 120), 1))
+        painter.drawPolygon(bolt)
+        painter.end()
+
+        return QIcon(px)
+
+    def _setup_tray(self):
+        """Create and show the system tray icon with a right-click context menu."""
+        self.tray = QSystemTrayIcon(self._make_tray_icon(), parent=self)
+        self.tray.setToolTip("Interview Copilot — Running")
+
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu { background-color:#1e1e1e; color:#eeeeee; border:1px solid #444; font-family:'Segoe UI'; font-size:13px; }
+            QMenu::item:selected { background-color:#2a2a2a; }
+            QMenu::separator { height:1px; background:#444; margin:4px 0; }
+        """)
+
+        show_action = menu.addAction("⚡  Show / Hide Overlay")
+        show_action.triggered.connect(self._toggle_visibility)
+
+        menu.addSeparator()
+
+        quit_action = menu.addAction("✕  Quit Interview Copilot")
+        quit_action.triggered.connect(QApplication.instance().quit)
+
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+        # Show a startup balloon notification
+        self.tray.showMessage(
+            "Interview Copilot",
+            "Running in background. Hotkeys: Ctrl+Shift+Space (trigger), Ctrl+R (regen).",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000
+        )
+
+    def _toggle_visibility(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        """Double-click or single-click on tray icon toggles overlay."""
+        if reason in (QSystemTrayIcon.ActivationReason.DoubleClick,
+                      QSystemTrayIcon.ActivationReason.Trigger):
+            self._toggle_visibility()
+
     def _get_resize_direction(self, pos):
         """Return a string like 'left', 'right', 'top', 'bottom', 'top-left', etc. or None."""
         m = self.RESIZE_MARGIN
