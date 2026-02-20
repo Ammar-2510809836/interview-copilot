@@ -6,7 +6,9 @@ import onnxruntime
 import sys
 import asyncio
 import logging
+import threading
 import qasync
+import keyboard
 from dotenv import load_dotenv
 
 from core.capture import CaptureEngine
@@ -24,6 +26,9 @@ session_logger.setLevel(logging.INFO)
 file_handler = logging.FileHandler("interview_session.log", mode="a", encoding="utf-8")
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 session_logger.addHandler(file_handler)
+
+# Thread-safe event for the global hotkey manual trigger
+manual_trigger_event = threading.Event()
 
 async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_overlay):
     transcript_history = []
@@ -133,6 +138,28 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
     while True:
         try:
+            # --- MANUAL HOTKEY TRIGGER ---
+            # Check if Ctrl+Shift+Space was pressed. If so, bypass all gates immediately.
+            if manual_trigger_event.is_set():
+                manual_trigger_event.clear()
+                if interviewer_accumulator or transcript_history:
+                    q_text = " ".join(interviewer_accumulator) if interviewer_accumulator else "(Manual trigger — use recent conversation context)"
+                    logger.info(f"Hotkey: Manual trigger fired! Forcing LLM call.")
+                    interviewer_accumulator.clear()
+                    interviewer_start_time = None
+                    last_advice = "<i style='color:#888888'>Copilot Thinking (Manual)...</i>"
+                    update_ui()
+                    context = rag_manager.retrieve_context(q_text)
+                    answer = await llm_client.generate_answer(transcript_history, context)
+                    answer_clean = answer.strip() if answer else ""
+                    if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
+                        session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
+                        last_advice = answer_clean
+                    else:
+                        last_advice = "<i style='color:#888888'>(No answer generated)</i>"
+                    update_ui()
+                continue
+
             try:
                 # Wait for incoming transcriptions.
                 # 2.5s timeout for fast responsiveness, with rule-based gating below.
@@ -243,11 +270,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     
                     if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
                         logger.info(f"LLM Advice generated.")
-                        # Log the full technical advice to the background file
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
-                        
-                        # Parse out markdown bold since simple rich text QLabel handles <b> better
-                        answer_clean = answer_clean.replace("**", "<b>").replace("**", "</b>")
                         last_advice = answer_clean
                     else:
                         logger.info(f"LLM skipped conversational filler.")
@@ -265,6 +288,10 @@ def main():
     Wires all modules together async via QEventLoop.
     """
     load_dotenv()
+    
+    # Register global hotkey — Ctrl+Shift+Space forces an immediate LLM call
+    keyboard.add_hotkey('ctrl+shift+space', lambda: manual_trigger_event.set())
+    logger.info("Hotkey registered: Ctrl+Shift+Space = Manual LLM Trigger")
     
     app = create_app()
     loop = qasync.QEventLoop(app)

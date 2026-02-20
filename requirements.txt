@@ -6,3 +6,4 @@ groq>=0.4.2
 PyQt6>=6.6.1
 python-dotenv>=1.0.1
 qasync>=0.27.1
+keyboard>=0.13.5
