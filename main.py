@@ -61,10 +61,13 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # End of code block — render it
                     code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
                     label = f"<span style='color:#aaaaaa; font-size:11px;'>{code_lang}</span><br>" if code_lang else ""
+                    code_font = ui_overlay.CODE_FONT
                     html_lines.append(
-                        f"<div style='background:#1a1a2e; border-left:3px solid #00fa9a; "
-                        f"border-radius:4px; padding:8px; margin:4px 0; font-family:Consolas,monospace; "
-                        f"font-size:13px; color:#e0e0e0;'>{label}{code_content}</div>"
+                        f"<div style='background:#0d1117; border-left:3px solid #00fa9a; "
+                        f"border-radius:5px; padding:10px 12px; margin:6px 0; "
+                        f"font-family:\"{code_font}\",Consolas,monospace; "
+                        f"font-size:12.5px; line-height:1.5; color:#c9d1d9;'>"
+                        f"{label}{code_content}</div>"
                     )
                     in_code_block = False
                     code_lang = ""

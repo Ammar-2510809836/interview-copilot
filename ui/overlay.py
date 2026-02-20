@@ -1,7 +1,8 @@
 import sys
+import os
 from PyQt6.QtWidgets import QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizeGrip
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPoint, QRect
-from PyQt6.QtGui import QFont, QCursor
+from PyQt6.QtGui import QFont, QCursor, QFontDatabase
 
 class WorkerSignals(QObject):
     """Signals for communicating with the UI thread from async tasks."""
@@ -10,9 +11,27 @@ class WorkerSignals(QObject):
 class UIOverlay(QWidget):
     # Resize zone thickness in pixels
     RESIZE_MARGIN = 8
+    # Loaded monospace font family name (set by _load_fonts)
+    CODE_FONT = "Consolas"  # fallback if JetBrains Mono not loaded
+
+    @classmethod
+    def _load_fonts(cls):
+        """Load bundled fonts into Qt using QFontDatabase."""
+        font_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "fonts", "JetBrainsMono-Regular.ttf")
+        if os.path.exists(font_path):
+            font_id = QFontDatabase.addApplicationFont(font_path)
+            if font_id != -1:
+                families = QFontDatabase.applicationFontFamilies(font_id)
+                if families:
+                    cls.CODE_FONT = families[0]
+                    print(f"[Font] Loaded: {cls.CODE_FONT}")
+                    return
+        print(f"[Font] JetBrains Mono not found, using fallback: {cls.CODE_FONT}")
+
 
     def __init__(self):
         super().__init__()
+        UIOverlay._load_fonts()
 
         # 1. Window Settings: Frameless, Always on Top, Tool window (hides from taskbar)
         self.setWindowFlags(
@@ -107,12 +126,19 @@ class UIOverlay(QWidget):
         self.text_label.setWordWrap(True)
         self.text_label.setTextFormat(Qt.TextFormat.RichText)
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.text_label.setStyleSheet("""
-            color: #eeeeee;
+        self.text_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard |
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.text_label.setStyleSheet(f"""
+            color: #e8e8e8;
             font-size: 14px;
-            font-family: Segoe UI, sans-serif;
+            font-family: 'Segoe UI', 'Arial', sans-serif;
+            line-height: 1.6;
             background: transparent;
             border: none;
+            padding: 2px 4px;
         """)
 
         self.scroll_area.setWidget(self.text_label)
