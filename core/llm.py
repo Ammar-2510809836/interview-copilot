@@ -107,6 +107,37 @@ code here
             logger.error(f"LLM Generation failed: {e}")
             return "Error generating response."
 
+    async def generate_answer_regen(self, transcript_history: list, rag_context: str, last_question: str = "") -> str:
+        """Same as generate_answer but with higher temperature for a fresh, different take.
+        Never returns SKIP — always generates a new answer for the given question."""
+        if not self.client:
+            return "Error: Groq API Key missing."
+        recent_history = "\n".join(transcript_history[-15:])
+        model, max_tokens = self._route_model((last_question + " " + recent_history).lower())
+        
+        question_prompt = last_question if last_question else "the most recent interview question in the conversation"
+        
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": (
+                f"Portfolio/Resume Context:\n{rag_context}\n\n"
+                f"Recent Conversation:\n{recent_history}\n\n"
+                f"The user pressed regenerate for this question: \"{question_prompt}\"\n"
+                f"Generate a DIFFERENT, FRESH answer. Do NOT say SKIP. Always provide an answer."
+            )}
+        ]
+        try:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.6  # Higher temperature = different answer each regen
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"LLM Regen failed: {e}")
+            return "Error regenerating response."
+
 
     async def is_question_complete(self, text: str) -> bool:
         """

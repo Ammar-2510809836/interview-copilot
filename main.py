@@ -27,8 +27,9 @@ file_handler = logging.FileHandler("interview_session.log", mode="a", encoding="
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 session_logger.addHandler(file_handler)
 
-# Thread-safe event for the global hotkey manual trigger
-manual_trigger_event = threading.Event()
+# Thread-safe events for global hotkeys
+manual_trigger_event = threading.Event()  # Ctrl+Shift+Space
+regen_trigger_event = threading.Event()   # Ctrl+R
 
 async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_overlay):
     transcript_history = []
@@ -58,7 +59,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     code_lines = []
                 else:
                     # End of code block — render it
-                    code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;").replace("\n", "<br>")
+                    code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
                     label = f"<span style='color:#aaaaaa; font-size:11px;'>{code_lang}</span><br>" if code_lang else ""
                     html_lines.append(
                         f"<div style='background:#1a1a2e; border-left:3px solid #00fa9a; "
@@ -176,6 +177,28 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         last_advice = answer_clean
                     else:
                         last_advice = "<i style='color:#888888'>(No answer generated)</i>"
+                    update_ui()
+                continue
+
+            # --- REGENERATION HOTKEY (Ctrl+R) ---
+            # Re-run the LLM on the last question with a fresh answer.
+            if regen_trigger_event.is_set():
+                regen_trigger_event.clear()
+                if last_question or transcript_history:
+                    logger.info("Hotkey: Ctrl+R fired! Regenerating last answer...")
+                    last_advice = "<i style='color:#888888'>Regenerating...</i>"
+                    update_ui()
+                    q_text = last_question if last_question else "(use recent conversation context)"
+                    context = rag_manager.retrieve_context(q_text)
+                    answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=last_question)
+                    answer_clean = answer.strip() if answer else ""
+                    if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
+                        session_logger.info(f"[COPILOT ADVICE (REGEN)]:\n{answer_clean}\n" + "="*50)
+                        last_advice = answer_clean
+                        if qa_history:
+                            qa_history[-1] = (last_question, answer_clean)
+                    else:
+                        last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
                     update_ui()
                 continue
 
@@ -316,6 +339,10 @@ def main():
     # Register global hotkey — Ctrl+Shift+Space forces an immediate LLM call
     keyboard.add_hotkey('ctrl+shift+space', lambda: manual_trigger_event.set())
     logger.info("Hotkey registered: Ctrl+Shift+Space = Manual LLM Trigger")
+    
+    # Register Ctrl+R hotkey for answer regeneration
+    keyboard.add_hotkey('ctrl+r', lambda: regen_trigger_event.set())
+    logger.info("Hotkey registered: Ctrl+R = Regenerate Last Answer")
     
     app = create_app()
     loop = qasync.QEventLoop(app)
