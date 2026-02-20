@@ -6,6 +6,7 @@ import onnxruntime
 import sys
 import re
 import time
+import json
 import asyncio
 import logging
 import threading
@@ -17,15 +18,21 @@ from core.capture import CaptureEngine
 from core.transcription import TranscriptionEngine
 from core.rag import RAGManager
 from core.llm import LLMClient
+import logging.handlers
 from ui.overlay import UIOverlay, create_app
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configure background session logger for full history
+# Configure background session logger — rotates daily, keeps 7 days
 session_logger = logging.getLogger("session_recorder")
 session_logger.setLevel(logging.INFO)
-file_handler = logging.FileHandler("interview_session.log", mode="a", encoding="utf-8")
+file_handler = logging.handlers.TimedRotatingFileHandler(
+    "interview_session.log",
+    when="midnight",
+    backupCount=7,
+    encoding="utf-8"
+)
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 session_logger.addHandler(file_handler)
 
@@ -41,7 +48,24 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     
     last_question = ""
     last_advice = ""
-    qa_history = []  # List of (question, advice) tuples — last 3 Q&A pairs
+
+    # Load qa_history from previous session (persists across restarts)
+    QA_HISTORY_FILE = "qa_history.json"
+    try:
+        with open(QA_HISTORY_FILE, "r", encoding="utf-8") as f:
+            qa_history = [tuple(pair) for pair in json.load(f)]
+        logger.info(f"Loaded {len(qa_history)} Q&A pair(s) from previous session.")
+    except (FileNotFoundError, json.JSONDecodeError):
+        qa_history = []
+
+    def _save_qa_history():
+        """Persist qa_history to disk so it survives restarts."""
+        try:
+            with open(QA_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(qa_history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save qa_history: {e}")
+
     
     def markdown_to_html(text: str) -> str:
         """Convert LLM markdown output to styled HTML for the QLabel."""
@@ -208,6 +232,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         last_advice = answer_clean
                         if qa_history:
                             qa_history[-1] = (last_question, answer_clean)
+                            _save_qa_history()  # Persist to disk
                     else:
                         last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
                     update_ui()
@@ -351,6 +376,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         qa_history.append((last_question, answer_clean))
                         if len(qa_history) > 3:
                             qa_history.pop(0)
+                        _save_qa_history()  # Persist to disk
                     else:
                         logger.info(f"LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
@@ -370,13 +396,18 @@ def main():
     """
     load_dotenv()
     
-    # Register global hotkey — Ctrl+Shift+Space forces an immediate LLM call
-    keyboard.add_hotkey('ctrl+shift+space', lambda: manual_trigger_event.set())
-    logger.info("Hotkey registered: Ctrl+Shift+Space = Manual LLM Trigger")
-    
-    # Register Ctrl+R hotkey for answer regeneration
-    keyboard.add_hotkey('ctrl+r', lambda: regen_trigger_event.set())
-    logger.info("Hotkey registered: Ctrl+R = Regenerate Last Answer")
+    # Register global hotkeys — requires keyboard library (may need admin on Windows)
+    try:
+        keyboard.add_hotkey('ctrl+shift+space', lambda: manual_trigger_event.set())
+        logger.info("Hotkey registered: Ctrl+Shift+Space = Manual LLM Trigger")
+        keyboard.add_hotkey('ctrl+r', lambda: regen_trigger_event.set())
+        logger.info("Hotkey registered: Ctrl+R = Regenerate Last Answer")
+    except Exception as e:
+        logger.warning(
+            f"Hotkey registration failed: {e}\n"
+            "Try running as Administrator, or install: pip install keyboard\n"
+            "Hotkeys (Ctrl+Shift+Space, Ctrl+R) will be DISABLED this session."
+        )
     
     app = create_app()
     loop = qasync.QEventLoop(app)

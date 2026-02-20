@@ -84,9 +84,9 @@ Portfolio rules:
 
     async def generate_answer(self, transcript_history: list, rag_context: str) -> str:
         """
-        Triggers only on [INTERVIEWER] questions.
-        Uses [ME] tags for conversational context but ignores them for new answers.
-        Restricts outputs to contextual sentences and concise bullet points.
+        Non-streaming fallback LLM call. Used internally and available as a
+        reliable synchronous-style alternative to generate_answer_stream.
+        Kept intentionally — useful for testing and as a fallback if streaming fails.
         """
         if not self.client:
             return "Error: Groq API Key missing."
