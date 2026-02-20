@@ -38,6 +38,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     
     last_question = ""
     last_advice = ""
+    qa_history = []  # List of (question, advice) tuples — last 3 Q&A pairs
     
     def markdown_to_html(text: str) -> str:
         """Convert LLM markdown output to styled HTML for the QLabel."""
@@ -95,6 +96,24 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
     def update_ui():
         html = ""
+
+        # Render historical Q&A pairs (faded) — oldest first
+        for i, (hist_q, hist_a) in enumerate(qa_history):
+            # Progressively fade older entries: oldest=40%, middle=65%
+            opacity = 0.35 + (i / max(len(qa_history), 1)) * 0.35
+            fade = f"opacity:{opacity:.2f};"
+            advice_html = markdown_to_html(hist_a)
+            html += (
+                f"<div style='{fade} margin-bottom:6px;'>"
+                f"<div style='border-left:2px solid #336644; padding:4px 8px; border-radius:3px;'>"
+                f"<span style='color:#607060; font-size:10px; font-weight:bold;'>PREV QUESTION</span><br>"
+                f"<span style='color:#aaaaaa; font-size:12px;'>{hist_q}</span></div>"
+                f"<div style='padding:4px 8px; color:#888888; font-size:12px;'>{advice_html}</div>"
+                f"</div>"
+                f"<hr style='border:none; border-top:1px solid #2a2a2a; margin:4px 0;'>"
+            )
+
+        # Render current active Q&A (full brightness)
         if last_question:
             html += (
                 f"<div style='background:#1e2a1e; border-left:3px solid #00fa9a; "
@@ -272,11 +291,16 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         logger.info(f"LLM Advice generated.")
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
                         last_advice = answer_clean
+                        # Push completed Q&A to scrollable history (keep last 3)
+                        qa_history.append((last_question, answer_clean))
+                        if len(qa_history) > 3:
+                            qa_history.pop(0)
                     else:
                         logger.info(f"LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
                         
                     update_ui()
+
                     
         except asyncio.CancelledError:
             break
