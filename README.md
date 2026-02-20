@@ -2,7 +2,7 @@
 
 > A real-time, AI-powered interview assistant that listens to your interview, understands questions, and streams smart first-person answers directly to a sleek on-screen overlay — all with no copy-paste needed.
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![PyQt6](https://img.shields.io/badge/UI-PyQt6-green) ![Groq](https://img.shields.io/badge/LLM-Groq%20Llama3-orange) ![Deepgram](https://img.shields.io/badge/STT-Deepgram%20Nova2-purple) ![Tests](https://img.shields.io/badge/Tests-33%20passing-brightgreen) ![Production](https://img.shields.io/badge/Production%20Ready-9.5%2F10-gold)
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![PyQt6](https://img.shields.io/badge/UI-PyQt6-green) ![Groq](https://img.shields.io/badge/LLM-Groq%20Llama3-orange) ![Deepgram](https://img.shields.io/badge/STT-Deepgram%20Nova2-purple) ![Tests](https://img.shields.io/badge/Tests-33%20passing-brightgreen)
 
 ---
 
@@ -172,16 +172,16 @@ python-dotenv
 
 ---
 
-## 🏆 Production Readiness: 9.5 / 10
+## 🏆 Production Readiness:
 
 | Area | Score | Notes |
 |---|---|---|
-| Architecture | ✅ 10/10 | Clean module separation, async throughout |
-| Error Handling | ✅ 10/10 | Every external call wrapped, UI shows error state on failure |
-| Security | ✅ 10/10 | No secrets in code or history |
-| Reliability | ✅ 9/10 | WS auto-reconnect, bounded queues, log rotation |
-| Test Coverage | ✅ 9/10 | 33 tests across all core modules |
-| Documentation | ✅ 10/10 | This README |
+| Architecture | ✅ Clean module separation, async throughout |
+| Error Handling | ✅  Every external call wrapped, UI shows error state on failure |
+| Security | ✅  No secrets in code or history |
+| Reliability | ✅ WS auto-reconnect, bounded queues, log rotation |
+| Test Coverage | ✅ 33 tests across all core modules |
+| Documentation | ✅ This README |
 
 ---
 
