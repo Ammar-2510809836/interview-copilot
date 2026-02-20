@@ -34,18 +34,80 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     last_question = ""
     last_advice = ""
     
+    def markdown_to_html(text: str) -> str:
+        """Convert LLM markdown output to styled HTML for the QLabel."""
+        import re
+        lines = text.split('\n')
+        html_lines = []
+        in_code_block = False
+        code_lang = ""
+        code_lines = []
+
+        for line in lines:
+            # --- Fenced code block handling ---
+            if line.strip().startswith("```"):
+                if not in_code_block:
+                    in_code_block = True
+                    code_lang = line.strip()[3:].strip()
+                    code_lines = []
+                else:
+                    # End of code block — render it
+                    code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;").replace("\n", "<br>")
+                    label = f"<span style='color:#aaaaaa; font-size:11px;'>{code_lang}</span><br>" if code_lang else ""
+                    html_lines.append(
+                        f"<div style='background:#1a1a2e; border-left:3px solid #00fa9a; "
+                        f"border-radius:4px; padding:8px; margin:4px 0; font-family:Consolas,monospace; "
+                        f"font-size:13px; color:#e0e0e0;'>{label}{code_content}</div>"
+                    )
+                    in_code_block = False
+                    code_lang = ""
+                continue
+
+            if in_code_block:
+                code_lines.append(line)
+                continue
+
+            # --- Inline formatting ---
+            # Bold: **text**
+            line = re.sub(r'\*\*(.+?)\*\*', r"<b style='color:#ffffff;'>\1</b>", line)
+            # Inline code: `code`
+            line = re.sub(r'`([^`]+)`', r"<code style='background:#1a1a2e; color:#00fa9a; font-family:Consolas,monospace; padding:1px 4px; border-radius:3px;'>\1</code>", line)
+
+            # --- Bullet points: • or - at start ---
+            stripped = line.strip()
+            if stripped.startswith("•") or (stripped.startswith("-") and len(stripped) > 2):
+                content = stripped.lstrip("•- ").strip()
+                html_lines.append(
+                    f"<div style='margin:3px 0 3px 8px; color:#cccccc;'>"
+                    f"<span style='color:#00fa9a; font-weight:bold;'>▸</span>&nbsp;{content}</div>"
+                )
+            elif stripped == "":
+                html_lines.append("<br>")
+            else:
+                html_lines.append(f"<span style='color:#cccccc;'>{line}</span><br>")
+
+        return "".join(html_lines)
+
     def update_ui():
-        # Create a structured layout using basic HTML
         html = ""
         if last_question:
-            html += f"<b style='color:#ffffff'>Q: {last_question}</b><br><br>"
-            
+            html += (
+                f"<div style='background:#1e2a1e; border-left:3px solid #00fa9a; "
+                f"padding:6px 10px; border-radius:4px; margin-bottom:8px;'>"
+                f"<span style='color:#aaaaaa; font-size:11px; font-weight:bold;'>INTERVIEWER</span><br>"
+                f"<b style='color:#ffffff; font-size:14px;'>{last_question}</b></div>"
+            )
+
         if last_advice:
-            # Always show copilot's advice once it's available
-            advice_html = last_advice.replace('\n', '<br>')
-            html += f"<span style='color:#00fa9a'><b>[COPILOT]:</b><br>{advice_html}</span><br><br>"
-            
+            advice_html = markdown_to_html(last_advice)
+            html += (
+                f"<div style='margin-top:4px;'>"
+                f"<span style='color:#00fa9a; font-size:11px; font-weight:bold;'>⚡ COPILOT</span><br>"
+                f"{advice_html}</div>"
+            )
+
         ui_overlay.update_text(html)
+
 
     # Set of words that indicate a sentence is cut off mid-thought
     # If the accumulated text ends with one of these, keep listening
