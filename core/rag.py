@@ -53,9 +53,16 @@ class RAGManager:
         except Exception as e:
             logger.error(f"Failed to ingest portfolio: {e}")
 
-    def retrieve_context(self, query: str, n_results: int = 2) -> str:
+    # Chunks with L2 distance above this threshold are considered irrelevant
+    # ChromaDB uses squared L2 by default: 0 = identical, 2 = max distance
+    # Empirically, > 1.2 = poor match, keep only good matches
+    SIMILARITY_THRESHOLD = 1.2
+
+    def retrieve_context(self, query: str, n_results: int = 3) -> str:
         """
         Retrieves relevant concepts based on the ongoing conversation.
+        Filters out chunks whose similarity score is below the confidence threshold
+        to prevent irrelevant noise from polluting the LLM context.
         """
         try:
             if self.collection.count() == 0:
@@ -63,15 +70,30 @@ class RAGManager:
 
             results = self.collection.query(
                 query_texts=[query],
-                n_results=n_results
+                n_results=min(n_results, self.collection.count()),
+                include=["documents", "distances"]
             )
-            
+
             if not results["documents"] or not results["documents"][0]:
                 return "No relevant portfolio context found."
-                
-            context = "\n---\n".join(results["documents"][0])
-            return context
-            
+
+            docs = results["documents"][0]
+            distances = results["distances"][0]
+
+            # Filter: keep only chunks that are genuinely relevant
+            good_chunks = []
+            for doc, dist in zip(docs, distances):
+                logger.info(f"RAG: distance={dist:.3f} | chunk='{doc[:60]}...'")
+                if dist <= self.SIMILARITY_THRESHOLD:
+                    good_chunks.append(doc)
+
+            if not good_chunks:
+                logger.info(f"RAG: No chunks passed the confidence threshold ({self.SIMILARITY_THRESHOLD}). Returning empty context.")
+                return "(No specific portfolio context for this question. Answer from general best practices and industry knowledge.)"
+
+            logger.info(f"RAG: {len(good_chunks)}/{len(docs)} chunks passed the confidence filter.")
+            return "\n---\n".join(good_chunks)
+
         except Exception as e:
             logger.error(f"Failed to retrieve RAG context: {e}")
             return "Error retrieving context."

@@ -163,21 +163,29 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
             if manual_trigger_event.is_set():
                 manual_trigger_event.clear()
                 if interviewer_accumulator or transcript_history:
-                    q_text = " ".join(interviewer_accumulator) if interviewer_accumulator else "(Manual trigger — use recent conversation context)"
+                    q_text = " ".join(interviewer_accumulator) if interviewer_accumulator else last_question
+                    if not q_text:
+                        # Fallback: scan recent history for last interviewer line
+                        for msg in reversed(transcript_history):
+                            if msg.startswith("[INTERVIEWER]"):
+                                q_text = msg.replace("[INTERVIEWER]: ", "").strip()
+                                break
                     logger.info(f"Hotkey: Manual trigger fired! Forcing LLM call.")
                     interviewer_accumulator.clear()
                     interviewer_start_time = None
                     last_advice = "<i style='color:#888888'>Copilot Thinking (Manual)...</i>"
                     update_ui()
                     context = rag_manager.retrieve_context(q_text)
-                    answer = await llm_client.generate_answer(transcript_history, context)
+                    # Use regen method — it NEVER returns SKIP, always generates an answer
+                    answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=q_text)
                     answer_clean = answer.strip() if answer else ""
-                    if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
+                    if answer_clean and not answer_clean.startswith("Error"):
                         session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
                         last_advice = answer_clean
                     else:
                         last_advice = "<i style='color:#888888'>(No answer generated)</i>"
                     update_ui()
+
                 continue
 
             # --- REGENERATION HOTKEY (Ctrl+R) ---
