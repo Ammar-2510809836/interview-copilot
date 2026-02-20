@@ -44,6 +44,33 @@ code here
 """
 
 
+    # Keywords that indicate a question needs the powerful large model
+    TECHNICAL_KEYWORDS = {
+        'algorithm', 'implement', 'code', 'design', 'architecture', 'system',
+        'database', 'sql', 'nosql', 'docker', 'kubernetes', 'k8s', 'aws',
+        'azure', 'gcp', 'cloud', 'linux', 'bash', 'python', 'api', 'rest',
+        'graphql', 'microservice', 'latency', 'throughput', 'scalab', 'deploy',
+        'devops', 'cicd', 'pipeline', 'terraform', 'debug', 'memory', 'cpu',
+        'kernel', 'thread', 'async', 'concurrent', 'network', 'tcp', 'http',
+        'rag', 'llm', 'vector', 'embedding', 'model', 'train', 'neural',
+        'complexity', 'optimize', 'cache', 'load balanc', 'distributed',
+        'security', 'encrypt', 'auth', 'token', 'jwt', 'oauth',
+    }
+
+    def _route_model(self, question_text: str) -> tuple[str, int]:
+        """
+        Route to fast (8b) or powerful (70b) model based on question content.
+        Returns (model_name, max_tokens).
+        """
+        text_lower = question_text.lower()
+        is_technical = any(kw in text_lower for kw in self.TECHNICAL_KEYWORDS)
+        if is_technical:
+            logger.info("Router: Technical question → llama-3.3-70b-versatile")
+            return "llama-3.3-70b-versatile", 400
+        else:
+            logger.info("Router: Behavioral/HR question → llama-3.1-8b-instant")
+            return "llama-3.1-8b-instant", 250
+
     async def generate_answer(self, transcript_history: list, rag_context: str) -> str:
         """
         Triggers only on [INTERVIEWER] questions.
@@ -56,6 +83,10 @@ code here
         # Combine last N transcripts to give the LLM conversation context
         recent_history = "\n".join(transcript_history[-15:])
         
+        # Route to the right model based on question complexity
+        recent_lower = recent_history.lower()
+        model, max_tokens = self._route_model(recent_lower)
+        
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": f"Portfolio/Resume Context:\n{rag_context}\n\nRecent Conversation:\n{recent_history}\n\nGenerate your response now. If no [INTERVIEWER] question is present, reply exactly with 'SKIP'."}
@@ -63,10 +94,10 @@ code here
         
         try:
             response = await self.client.chat.completions.create(
-                model=self.model, # Fast, lightweight model for ultra low latency
+                model=model,
                 messages=messages,
-                max_tokens=200, # Increased limit to allow context lines and code syntax
-                temperature=0.2 # Low temperature to prevent hallucination
+                max_tokens=max_tokens,
+                temperature=0.2
             )
             
             output = response.choices[0].message.content.strip()
@@ -75,6 +106,7 @@ code here
         except Exception as e:
             logger.error(f"LLM Generation failed: {e}")
             return "Error generating response."
+
 
     async def is_question_complete(self, text: str) -> bool:
         """
