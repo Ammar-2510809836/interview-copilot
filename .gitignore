@@ -17,8 +17,6 @@ chroma.sqlite3
 interview_session.log
 interview_session.log.*
 # Runtime session state (auto-generated)
-qa_history.json
-
 # Virtual environments
 venv/
 env/

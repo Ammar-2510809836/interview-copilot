@@ -38,7 +38,6 @@
 | **Resizable Overlay** | Drag any edge or corner to resize; always-on-top, click-through design |
 | **JetBrains Mono Font** | Bundled in `assets/fonts/` — premium monospace for code blocks |
 | **Markdown Rendering** | Bold, inline code, fenced code blocks with label, bullet points — all rendered as styled HTML |
-| **Scrollable Q&A History** | Last 3 Q&A pairs with progressive opacity fading (older = more faded) |
 | **Copyable Text** | Select any text in overlay with mouse, `Ctrl+C` to copy |
 | **System Tray Icon** | Neon green ⚡ icon — right-click to Show/Hide/Quit; click X to hide (app keeps running) |
 | **Startup Notification** | Windows balloon toast on launch with hotkey reminder |
@@ -54,6 +53,8 @@ cd interview-copilot
 ```
 
 ### 2. Install Dependencies
+> **⚠️ Python Version Requirement:** You **must** use Python 3.12 or 3.13. Python 3.14+ is effectively unsupported by the `pyaudio` community wheels on Windows and will fail to install unless you manually install C++ build tools.
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -165,7 +166,6 @@ python-dotenv
 | API keys in `.env` | ✅ Git-ignored — **never committed** |
 | No hardcoded credentials | ✅ All keys use `os.getenv()` only |
 | `interview_session.log` | ✅ Git-ignored + daily log rotation (7 days kept) |
-| `qa_history.json` | ✅ Git-ignored (runtime state) |
 | `chroma_db/` | ✅ Git-ignored (in-memory ChromaDB, no disk persistence) |
 
 > **Verified:** `git log --all -- .env` returns empty — the `.env` file was **never committed at any point** in the git history.

@@ -49,22 +49,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     last_question = ""
     last_advice = ""
 
-    # Load qa_history from previous session (persists across restarts)
-    QA_HISTORY_FILE = "qa_history.json"
-    try:
-        with open(QA_HISTORY_FILE, "r", encoding="utf-8") as f:
-            qa_history = [tuple(pair) for pair in json.load(f)]
-        logger.info(f"Loaded {len(qa_history)} Q&A pair(s) from previous session.")
-    except (FileNotFoundError, json.JSONDecodeError):
-        qa_history = []
-
-    def _save_qa_history():
-        """Persist qa_history to disk so it survives restarts."""
-        try:
-            with open(QA_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(qa_history, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"Could not save qa_history: {e}")
+    last_advice = ""
 
     
     def markdown_to_html(text: str) -> str:
@@ -128,21 +113,6 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
     def update_ui():
         try:
             html = ""
-
-            # Render historical Q&A pairs (faded) — oldest first
-            for i, (hist_q, hist_a) in enumerate(qa_history):
-                opacity = 0.35 + (i / max(len(qa_history), 1)) * 0.35
-                fade = f"opacity:{opacity:.2f};"
-                advice_html = markdown_to_html(hist_a)
-                html += (
-                    f"<div style='{fade} margin-bottom:6px;'>"
-                    f"<div style='border-left:2px solid #336644; padding:4px 8px; border-radius:3px;'>"
-                    f"<span style='color:#607060; font-size:10px; font-weight:bold;'>PREV QUESTION</span><br>"
-                    f"<span style='color:#aaaaaa; font-size:12px;'>{hist_q}</span></div>"
-                    f"<div style='padding:4px 8px; color:#888888; font-size:12px;'>{advice_html}</div>"
-                    f"</div>"
-                    f"<hr style='border:none; border-top:1px solid #2a2a2a; margin:4px 0;'>"
-                )
 
             # Render current active Q&A (full brightness)
             if last_question:
@@ -238,9 +208,6 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
                             session_logger.info(f"[COPILOT ADVICE (REGEN)]:\n{answer_clean}\n" + "="*50)
                             last_advice = answer_clean
-                            if qa_history:
-                                qa_history[-1] = (last_question, answer_clean)
-                                _save_qa_history()  # Persist to disk
                         else:
                             last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
                     except Exception as e:
@@ -383,11 +350,6 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         logger.info(f"LLM Advice generated.")
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
                         last_advice = answer_clean  # Full markdown render happens in update_ui()
-                        # Push completed Q&A to scrollable history (keep last 3)
-                        qa_history.append((last_question, answer_clean))
-                        if len(qa_history) > 3:
-                            qa_history.pop(0)
-                        _save_qa_history()  # Persist to disk
                     else:
                         logger.info(f"LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
