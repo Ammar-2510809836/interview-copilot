@@ -183,6 +183,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         if answer_clean and not answer_clean.startswith("Error"):
                             session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
                             last_advice = answer_clean
+                            transcript_history.append(f"[COPILOT]: {answer_clean}")
+                            if len(transcript_history) > 30:
+                                transcript_history.pop(0)
                         else:
                             last_advice = "<i style='color:#888888'>(No answer generated)</i>"
                     except Exception as e:
@@ -208,6 +211,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
                             session_logger.info(f"[COPILOT ADVICE (REGEN)]:\n{answer_clean}\n" + "="*50)
                             last_advice = answer_clean
+                            transcript_history.append(f"[COPILOT]: {answer_clean}")
+                            if len(transcript_history) > 30:
+                                transcript_history.pop(0)
                         else:
                             last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
                     except Exception as e:
@@ -350,6 +356,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         logger.info(f"LLM Advice generated.")
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
                         last_advice = answer_clean  # Full markdown render happens in update_ui()
+                        transcript_history.append(f"[COPILOT]: {answer_clean}")
+                        if len(transcript_history) > 30:
+                            transcript_history.pop(0)
                     else:
                         logger.info(f"LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
