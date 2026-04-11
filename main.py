@@ -3,6 +3,7 @@
 import chromadb
 import onnxruntime
 
+import os
 import sys
 import re
 import time
@@ -27,8 +28,18 @@ logger = logging.getLogger(__name__)
 # Configure background session logger — rotates daily, keeps 7 days
 session_logger = logging.getLogger("session_recorder")
 session_logger.setLevel(logging.INFO)
+
+def get_run_dir():
+    """Returns the external directory where the user launched the app/exe."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+run_dir = get_run_dir()
+
+# Ensure logs and history write to the user directory, not the internal PyInstaller temp path
 file_handler = logging.handlers.TimedRotatingFileHandler(
-    "interview_session.log",
+    os.path.join(run_dir, "interview_session.log"),
     when="midnight",
     backupCount=7,
     encoding="utf-8"
@@ -42,16 +53,92 @@ regen_trigger_event = threading.Event()   # Ctrl+R
 
 async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_overlay):
     transcript_history = []
-    
+
     interviewer_accumulator = []
     me_accumulator = []
-    
+
     last_question = ""
     last_advice = ""
 
-    last_advice = ""
+    # --- Conversation Memory State ---
+    conversation_state = {
+        "current_question_type": None,  # behavioral, technical, coding
+        "previous_question": "",
+        "previous_answer": "",
+        "conversation_summary": "",
+    }
 
-    
+    def is_followup_question(current_text: str, previous_question: str) -> bool:
+        """
+        Detect if current text is a follow-up to the previous question.
+        Uses heuristics like follow-up keywords and contextual references.
+        """
+        if not previous_question or not current_text:
+            return False
+
+        text_lower = current_text.lower().strip()
+
+        # Follow-up indicator words/phrases
+        followup_starters = [
+            "but", "what if", "how about", "why", "can you", "could you",
+            "would you", "do you", "how would", "what about", "what do you think",
+            "follow up", "following up", "going back", "referring to",
+            "you mentioned", "as you said", "that approach", "that solution",
+            "elaborate", "explain more", "tell me more", "expand on"
+        ]
+
+        # Check for follow-up starters
+        for starter in followup_starters:
+            if text_lower.startswith(starter) or f" {starter} " in text_lower:
+                logger.info(f"Follow-up detected: starts with '{starter}'")
+                return True
+
+        # Check if it's a short question after a long answer (likely follow-up)
+        word_count = len(text_lower.split())
+        if word_count < 8 and conversation_state["previous_answer"]:
+            logger.info(f"Follow-up detected: short question ({word_count} words) with previous answer")
+            return True
+
+        # Check for pronoun references to previous context
+        reference_words = ["it", "that", "this", "those", "they", "them"]
+        first_words = text_lower.split()[:3]
+        if any(w in reference_words for w in first_words) and conversation_state["previous_answer"]:
+            logger.info("Follow-up detected: pronoun reference to previous context")
+            return True
+
+        return False
+
+    def update_conversation_summary(question: str, answer: str, q_type: str):
+        """Update the running conversation summary."""
+        summary_parts = []
+
+        if q_type == "behavioral":
+            # Extract the topic from question
+            summary_parts.append(f"Discussed: {question[:60]}...")
+        elif q_type == "technical":
+            summary_parts.append(f"Covered technical topic: {question[:50]}...")
+        elif q_type == "coding":
+            summary_parts.append(f"Solved coding problem: {question[:50]}...")
+        else:
+            summary_parts.append(f"Q: {question[:50]}...")
+
+        # Keep only last 2-3 topics in summary (truncate to ~200 chars)
+        current = conversation_state["conversation_summary"]
+        new_entry = " | ".join(summary_parts)
+
+        if current:
+            # Append but keep reasonable length
+            combined = f"{current} | {new_entry}"
+            if len(combined) > 300:
+                # Keep last part
+                combined = combined[-300:]
+                # Try to start at a clean boundary
+                if " | " in combined:
+                    combined = combined.split(" | ", 1)[1]
+            conversation_state["conversation_summary"] = combined
+        else:
+            conversation_state["conversation_summary"] = new_entry
+
     def markdown_to_html(text: str) -> str:
         """Convert LLM markdown output to styled HTML for the QLabel."""
         try:
@@ -157,6 +244,11 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
     # Track when the interviewer started speaking for max-wait safety valve
     interviewer_start_time = None
+    
+    # Tracks the last full question that was answered, so if the interviewer
+    # continues speaking right after we answered, we can prepend the context
+    last_answered_question = ""
+    last_answer_time = 0  # time.time() when the last answer was generated
 
     while True:
         try:
@@ -177,8 +269,16 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         interviewer_start_time = None
                         last_advice = "<i style='color:#888888'>Copilot Thinking (Manual)...</i>"
                         update_ui()
+
+                        # Classify and detect follow-up
+                        q_type = await llm_client.classify_question(q_text)
+                        is_followup = is_followup_question(q_text, conversation_state["previous_question"])
+
                         context = rag_manager.retrieve_context(q_text)
-                        answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=q_text)
+                        answer = await llm_client.generate_answer_regen(
+                            transcript_history, context, last_question=q_text,
+                            question_type=q_type, conversation_summary=conversation_state["conversation_summary"]
+                        )
                         answer_clean = answer.strip() if answer else ""
                         if answer_clean and not answer_clean.startswith("Error"):
                             session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
@@ -186,6 +286,11 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                             transcript_history.append(f"[COPILOT]: {answer_clean}")
                             if len(transcript_history) > 30:
                                 transcript_history.pop(0)
+                            # Update conversation state
+                            conversation_state["current_question_type"] = q_type
+                            conversation_state["previous_question"] = q_text
+                            conversation_state["previous_answer"] = answer_clean
+                            update_conversation_summary(q_text, answer_clean, q_type)
                         else:
                             last_advice = "<i style='color:#888888'>(No answer generated)</i>"
                     except Exception as e:
@@ -205,8 +310,17 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         last_advice = "<i style='color:#888888'>Regenerating...</i>"
                         update_ui()
                         q_text = last_question if last_question else "(use recent conversation context)"
+
+                        # Use existing question type if available
+                        q_type = conversation_state.get("current_question_type")
+                        if not q_type:
+                            q_type = await llm_client.classify_question(q_text)
+
                         context = rag_manager.retrieve_context(q_text)
-                        answer = await llm_client.generate_answer_regen(transcript_history, context, last_question=last_question)
+                        answer = await llm_client.generate_answer_regen(
+                            transcript_history, context, last_question=last_question,
+                            question_type=q_type, conversation_summary=conversation_state["conversation_summary"]
+                        )
                         answer_clean = answer.strip() if answer else ""
                         if answer_clean and answer_clean != "SKIP" and not answer_clean.startswith("Error"):
                             session_logger.info(f"[COPILOT ADVICE (REGEN)]:\n{answer_clean}\n" + "="*50)
@@ -214,6 +328,8 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                             transcript_history.append(f"[COPILOT]: {answer_clean}")
                             if len(transcript_history) > 30:
                                 transcript_history.pop(0)
+                            # Update previous answer
+                            conversation_state["previous_answer"] = answer_clean
                         else:
                             last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
                     except Exception as e:
@@ -224,8 +340,8 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
             try:
                 # Wait for incoming transcriptions.
-                # 2.5s timeout for fast responsiveness, with rule-based gating below.
-                tag, sentence = await asyncio.wait_for(transcription_engine.text_queue.get(), timeout=2.5)
+                # 3.5s timeout — long enough for natural interviewer pauses between sentences.
+                tag, sentence = await asyncio.wait_for(transcription_engine.text_queue.get(), timeout=3.5)
                 
                 # Log everything to background session file
                 session_logger.info(f"{tag}: {sentence}")
@@ -244,6 +360,17 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         last_advice = ""
                         interviewer_accumulator.clear()
                         last_question = ""
+                    
+                    # --- CONTINUATION DETECTION ---
+                    # If the interviewer starts speaking again within 8 seconds of our
+                    # last answer, they were probably still asking the same question
+                    # and we jumped the gun. Prepend the previous question as context.
+                    if (last_answered_question 
+                        and not interviewer_accumulator 
+                        and (time.time() - last_answer_time) < 8.0):
+                        logger.info("Continuation detected: Interviewer resumed after premature answer. Prepending previous context.")
+                        interviewer_accumulator.append(last_answered_question)
+                        last_answered_question = ""  # Only do this once
                         
                     interviewer_accumulator.append(sentence)
                     last_question = " ".join(interviewer_accumulator)
@@ -270,30 +397,30 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     words = q_text.strip().split()
                     
                     # Gate 1: Minimum word count - no real question is under 4 words
-                    if len(words) < 4 and time_waited < 8.0:
+                    if len(words) < 4 and time_waited < 12.0:
                         logger.info(f"Rule Gate: Too few words ({len(words)}). Continuing to listen...")
                         continue
                     
                     # Gate 2: Comma-aware - speaker is listing items, not done yet
-                    if q_text.strip().endswith(',') and time_waited < 8.0:
+                    if q_text.strip().endswith(',') and time_waited < 12.0:
                         logger.info(f"Rule Gate: Trailing comma detected. Continuing to listen...")
                         continue
                     
                     # Gate 3: Dangling word check - last word is a preposition/conjunction
                     last_word = words[-1].lower().rstrip('.,!?;:') if words else ""
-                    if last_word in DANGLING_WORDS and time_waited < 8.0:
+                    if last_word in DANGLING_WORDS and time_waited < 12.0:
                         logger.info(f"Rule Gate: Dangling word '{last_word}' detected. Continuing to listen...")
                         continue
                     
-                    if time_waited >= 8.0:
-                        logger.info(f"Rule Gate: Max wait (8s) reached. Forcing answer generation.")
+                    if time_waited >= 12.0:
+                        logger.info(f"Rule Gate: Max wait (12s) reached. Forcing answer generation.")
                     else:
                         # --- COOLDOWN WINDOW ---
-                        # All gates passed, but wait 1.5s more to see if interviewer keeps talking.
-                        # This catches compound questions delivered as rapid-fire short sentences.
+                        # All gates passed, but wait 3.0s more to see if interviewer keeps talking.
+                        # This catches compound questions and natural pauses between sentences.
                         try:
                             tag2, sentence2 = await asyncio.wait_for(
-                                transcription_engine.text_queue.get(), timeout=1.5
+                                transcription_engine.text_queue.get(), timeout=3.0
                             )
                             # Someone spoke during cooldown!
                             session_logger.info(f"{tag2}: {sentence2}")
@@ -314,26 +441,44 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                                 # User started speaking during cooldown — generate answer NOW
                                 logger.info("Cooldown: User started speaking. Generating answer immediately.")
                         except asyncio.TimeoutError:
-                            # 1.5s of confirmed silence after gates passed — commit to answer
+                            # 3.0s of confirmed silence after gates passed — commit to answer
                             logger.info("Cooldown: Confirmed silence. Generating answer.")
                         
+                    # Save the full question before clearing, so we can use it as
+                    # context if the interviewer continues speaking (continuation detection)
+                    last_answered_question = q_text
+                    last_answer_time = time.time()
                     interviewer_accumulator.clear() # Clear so we don't re-trigger
                     interviewer_start_time = None  # Reset timer
-                    
+
+                    # --- QUESTION CLASSIFICATION & FOLLOW-UP DETECTION ---
+                    q_type = await llm_client.classify_question(q_text)
+                    is_followup = is_followup_question(q_text, conversation_state["previous_question"])
+
+                    if is_followup:
+                        logger.info(f"Detected follow-up question to: '{conversation_state['previous_question'][:50]}...'")
+
                     last_advice = "<i style='color:#888888'>Copilot Thinking...</i>"
                     update_ui()
-                    
-                    # Fetch RAG
-                    context = rag_manager.retrieve_context(q_text)
-                    
+
+                    # Fetch RAG with conversation history
+                    context = rag_manager.retrieve_context(q_text, conversation_history=transcript_history)
+
                     # --- STREAMING GENERATION ---
-                    # Show raw plain text while streaming (markdown parsing only at the end)
                     answer_clean = ""
                     skipped = False
                     batch_buffer = ""
                     BATCH_CHARS = 8
 
-                    async for token in llm_client.generate_answer_stream(transcript_history, context):
+                    # Show typing indicator
+                    ui_overlay.set_typing_indicator(True)
+
+                    async for token in llm_client.generate_answer_stream(
+                        transcript_history, context,
+                        question_type=q_type,
+                        is_followup=is_followup,
+                        conversation_summary=conversation_state["conversation_summary"]
+                    ):
                         if token == "__SKIP__":
                             skipped = True
                             break
@@ -341,13 +486,17 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         batch_buffer += token
                         # Update UI with raw text every ~8 chars or at sentence boundaries
                         if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
-                            # Show raw text during streaming — fast, no markdown parsing
+                            # Show raw text during streaming with question type
                             ui_overlay.update_text(
-                                f"<span style='color:#aaaaaa; font-size:11px; font-weight:bold;'>⚡ COPILOT (streaming...)</span><br>"
-                                f"<span style='color:#cccccc; font-size:14px; font-family:Segoe UI;'>{answer_clean.replace('<','&lt;').replace('>','&gt;')}</span>"
+                                answer_clean.replace('<','&lt;').replace('>','&gt;'),
+                                question_type=q_type if q_type else "generic",
+                                is_streaming=True
                             )
                             batch_buffer = ""
                             await asyncio.sleep(0.03)  # Give Qt time to repaint
+
+                    # Hide typing indicator
+                    ui_overlay.set_typing_indicator(False)
 
                     if skipped:
                         logger.info("LLM skipped conversational filler.")
@@ -355,15 +504,22 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     elif answer_clean and not answer_clean.startswith("Error"):
                         logger.info(f"LLM Advice generated.")
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
-                        last_advice = answer_clean  # Full markdown render happens in update_ui()
+                        last_advice = answer_clean
                         transcript_history.append(f"[COPILOT]: {answer_clean}")
                         if len(transcript_history) > 30:
                             transcript_history.pop(0)
+
+                        # Update conversation state
+                        conversation_state["current_question_type"] = q_type
+                        conversation_state["previous_question"] = q_text
+                        conversation_state["previous_answer"] = answer_clean
+                        update_conversation_summary(q_text, answer_clean, q_type)
                     else:
                         logger.info(f"LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
-                        
-                    update_ui()  # Final render with full markdown formatting
+
+                    # Final render with full markdown formatting
+                    ui_overlay.update_text(last_advice, question_type=q_type if q_type else "generic", is_streaming=False)
 
 
                     
@@ -376,7 +532,9 @@ def main():
     """
     Wires all modules together async via QEventLoop.
     """
-    load_dotenv()
+    # Load .env file from the user's run directory (so clients can supply their own keys)
+    run_dir = get_run_dir()
+    load_dotenv(os.path.join(run_dir, ".env"))
     
     # Register global hotkeys — requires keyboard library (may need admin on Windows)
     try:
@@ -398,7 +556,16 @@ def main():
     ui_overlay = UIOverlay()
 
     # Initialize RAG & LLM
-    rag_manager = RAGManager("data/portfolio.md")
+    # Look for portfolio.md in the data folder adjacent to the executable
+    portfolio_path = os.path.join(run_dir, "data", "portfolio.md")
+    
+    # Ensure data folder exists natively if missing (so RAG doesn't crash if user didn't make folder)
+    os.makedirs(os.path.dirname(portfolio_path), exist_ok=True)
+    if not os.path.exists(portfolio_path):
+        with open(portfolio_path, "w", encoding="utf-8") as f:
+            f.write("# Enter your resume or portfolio skills here!\n")
+            
+    rag_manager = RAGManager(portfolio_path)
     rag_manager.ingest_portfolio()
     llm_client = LLMClient()
     
