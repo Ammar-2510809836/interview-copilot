@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout,
                               QLabel, QPushButton, QScrollArea, QSizeGrip,
                               QSystemTrayIcon, QMenu)
@@ -9,6 +10,7 @@ from PyQt6.QtGui import QFont, QCursor, QFontDatabase, QPixmap, QPainter, QColor
 class WorkerSignals(QObject):
     """Signals for communicating with the UI thread from async tasks."""
     update_text = pyqtSignal(str)
+    set_typing_indicator = pyqtSignal(bool)
 
 class UIOverlay(QWidget):
     # Resize zone thickness in pixels
@@ -16,10 +18,27 @@ class UIOverlay(QWidget):
     # Loaded monospace font family name (set by _load_fonts)
     CODE_FONT = "Consolas"  # fallback if JetBrains Mono not loaded
 
+    # STAR section colors (subtle left borders)
+    STAR_COLORS = {
+        "situation": "#4a90d9",  # Blue
+        "task": "#f5a623",       # Orange
+        "action": "#7ed321",     # Green
+        "result": "#bd10e0",     # Purple
+    }
+
     @classmethod
     def _load_fonts(cls):
-        """Load bundled fonts into Qt using QFontDatabase."""
-        font_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "fonts", "JetBrainsMono-Regular.ttf")
+        """Load bundled fonts into Qt using QFontDatabase. Supports PyInstaller sys._MEIPASS."""
+        import sys # ensure sys is available here just in case, though it's at the top of the file
+        if getattr(sys, 'frozen', False):
+            # If the application is run as a bundle, the PyInstaller bootloader
+            # extends the sys module by a flag frozen=True and sets the app
+            # path into variable _MEIPASS.
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.dirname(__file__))
+
+        font_path = os.path.join(base_path, "assets", "fonts", "JetBrainsMono-Regular.ttf")
         if os.path.exists(font_path):
             font_id = QFontDatabase.addApplicationFont(font_path)
             if font_id != -1:
@@ -80,7 +99,7 @@ class UIOverlay(QWidget):
 
         self.top_bar.addStretch()
 
-        self.close_btn = QPushButton("✕")
+        self.close_btn = QPushButton("")
         self.close_btn.setFixedSize(22, 22)
         self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_btn.setStyleSheet("""
@@ -146,6 +165,18 @@ class UIOverlay(QWidget):
         self.scroll_area.setWidget(self.text_label)
         self.layout.addWidget(self.scroll_area)
 
+        # Typing indicator label (hidden by default)
+        self.typing_indicator = QLabel("")
+        self.typing_indicator.setStyleSheet("""
+            color: #00fa9a;
+            font-size: 12px;
+            font-family: 'Segoe UI', sans-serif;
+            font-style: italic;
+            padding: 4px 0;
+        """)
+        self.typing_indicator.hide()
+        self.layout.addWidget(self.typing_indicator)
+
         # 5. Bottom-right resize grip for discoverability
         grip_bar = QHBoxLayout()
         grip_bar.addStretch()
@@ -157,12 +188,219 @@ class UIOverlay(QWidget):
         # Signal wiring
         self.signals = WorkerSignals()
         self.signals.update_text.connect(self._set_text)
+        self.signals.set_typing_indicator.connect(self._set_typing_indicator)
         self.show()
         self._setup_tray()
 
+    # --- Structured Answer Formatting ---
+    def format_structured_answer(self, answer_text: str, question_text: str, question_type: str = "generic") -> str:
+        """
+        Parse different answer formats (STAR, technical, code) and apply appropriate HTML styling.
+
+        Args:
+            answer_text: The raw answer text from the LLM or pre-formatted HTML
+            question_type: Type of question - "star", "technical", "code", or "generic"
+
+        Returns:
+            HTML formatted string ready for display
+        """
+        if not answer_text:
+            return answer_text
+
+        # Check if text is already HTML (starts with < and contains HTML tags)
+        is_already_html = answer_text.strip().startswith('<') and any(tag in answer_text for tag in ['<div', '<span', '<br', '<b>', '<i>', '<p>'])
+
+        if is_already_html:
+            # Already HTML - don't escape, just return as-is
+            return answer_text
+
+        # Escape HTML special characters first for raw text
+        import html
+        escaped_text = html.escape(answer_text)
+
+        # Convert newlines to <br> tags
+        escaped_text = escaped_text.replace("\n", "<br>")
+
+        formatted_html = escaped_text
+
+        if question_type.lower() == "star":
+            formatted_html = self._format_star_answer(formatted_html)
+        elif question_type.lower() in ["technical", "code"]:
+            formatted_html = self._format_code_blocks(formatted_html)
+        else:
+            # Generic formatting - just detect and format code blocks
+            formatted_html = self._format_code_blocks(formatted_html)
+
+        return formatted_html
+
+    def _format_star_answer(self, html_text: str) -> str:
+        """Format STAR method answers with highlighted sections."""
+        # Pattern to match STAR headers (case insensitive)
+        star_headers = [
+            (r'(?i)(Situation|S|## Situation)', 'situation'),
+            (r'(?i)(Task|T|## Task)', 'task'),
+            (r'(?i)(Action|A|## Action)', 'action'),
+            (r'(?i)(Result|R|## Result)', 'result'),
+        ]
+
+        for pattern, section_type in star_headers:
+            # Replace headers with styled versions
+            def replace_header(match):
+                header_text = match.group(1).replace('## ', '')
+                color = self.STAR_COLORS.get(section_type, "#888")
+                return f'<div style="margin-top: 12px; padding: 8px 12px; border-left: 3px solid {color}; background-color: rgba({self._hex_to_rgb(color)}, 0.08); border-radius: 0 4px 4px 0;"><span style="color: {color}; font-weight: bold; font-size: 13px;">{header_text}</span></div>'
+
+            html_text = re.sub(pattern + r'[:\s]*(?:<br>|\n|$)', replace_header, html_text)
+
+        return html_text
+
+    def _format_code_blocks(self, html_text: str) -> str:
+        """Detect and format code blocks in markdown style."""
+        # Pattern to match ```language\ncode\n``` blocks
+        code_pattern = r'```(\w+)?<br>(.*?)<br>```'
+
+        def replace_code_block(match):
+            language = match.group(1) or "python"
+            code = match.group(2)
+            return self.render_code_block(code, language)
+
+        html_text = re.sub(code_pattern, replace_code_block, html_text, flags=re.DOTALL)
+
+        # Also handle inline `code` with backticks
+        inline_pattern = r'`([^`]+)`'
+        html_text = re.sub(inline_pattern,
+                          r'<code style="background-color: #2d2d2d; color: #00fa9a; padding: 1px 4px; border-radius: 3px; font-family: \'{}\', monospace; font-size: 13px;">\1</code>'.format(self.CODE_FONT),
+                          html_text)
+
+        return html_text
+
+    def _hex_to_rgb(self, hex_color: str) -> str:
+        """Convert hex color to RGB string for rgba()."""
+        hex_color = hex_color.lstrip('#')
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        return f"{r}, {g}, {b}"
+
+    def render_star_section(self, content: str, section_type: str) -> str:
+        """
+        Render individual STAR sections with color-coded left border.
+
+        Args:
+            content: The section content text
+            section_type: One of: "situation", "task", "action", "result"
+
+        Returns:
+            HTML formatted section
+        """
+        section_type = section_type.lower()
+        color = self.STAR_COLORS.get(section_type, "#888")
+        title = section_type.capitalize()
+
+        rgb = self._hex_to_rgb(color)
+
+        html = f"""
+        <div style="margin: 10px 0; padding: 12px 16px; border-left: 4px solid {color};
+                    background-color: rgba({rgb}, 0.08); border-radius: 0 6px 6px 0;">
+            <div style="color: {color}; font-weight: bold; font-size: 13px; margin-bottom: 6px;">
+                {title}
+            </div>
+            <div style="color: #e8e8e8; line-height: 1.5;">
+                {content}
+            </div>
+        </div>
+        """
+        return html.strip()
+
+    def render_code_block(self, code: str, language: str = "python") -> str:
+        """
+        Return HTML formatted code block with syntax highlighting styling.
+
+        Args:
+            code: The code content
+            language: Programming language for styling context
+
+        Returns:
+            HTML formatted code block
+        """
+        # Clean up the code (unescape HTML entities that were escaped earlier)
+        import html
+        code = html.unescape(code)
+
+        # Apply basic syntax highlighting colors
+        highlighted = self._apply_syntax_highlighting(code, language)
+
+        html_block = f"""
+        <div style="margin: 12px 0; background-color: #1e1e1e; border: 1px solid #333;
+                    border-radius: 8px; overflow: hidden;">
+            <div style="background-color: #2d2d2d; padding: 6px 12px; font-size: 11px;
+                        color: #888; font-family: '{self.CODE_FONT}', monospace; border-bottom: 1px solid #333;">
+                {language.upper()}
+            </div>
+            <div style="padding: 12px; background-color: #1e1e1e; font-family: '{self.CODE_FONT}', monospace;
+                        font-size: 13px; line-height: 1.5; color: #d4d4d4; white-space: pre-wrap; word-wrap: break-word;">
+                {highlighted}
+            </div>
+        </div>
+        """
+        return html_block.strip()
+
+    def _apply_syntax_highlighting(self, code: str, language: str) -> str:
+        """Apply basic syntax highlighting to code."""
+        import html
+
+        # Keywords for Python
+        if language.lower() == "python":
+            keywords = ['def', 'class', 'if', 'else', 'elif', 'for', 'while', 'return',
+                       'import', 'from', 'as', 'try', 'except', 'finally', 'with', 'pass',
+                       'break', 'continue', 'lambda', 'yield', 'raise', 'assert', 'del',
+                       'global', 'nonlocal', 'and', 'or', 'not', 'in', 'is', 'True', 'False', 'None']
+
+            # Escape HTML
+            code = html.escape(code)
+
+            # Highlight keywords
+            for kw in keywords:
+                pattern = r'\b' + kw + r'\b'
+                code = re.sub(pattern, f'<span style="color: #569cd6;">{kw}</span>', code)
+
+            # Highlight strings (simple pattern)
+            code = re.sub(r'(".*?")', r'<span style="color: #ce9178;">\1</span>', code)
+            code = re.sub(r"('.*?')", r'<span style="color: #ce9178;">\1</span>', code)
+
+            # Highlight comments
+            code = re.sub(r'(#.*)$', r'<span style="color: #6a9955;">\1</span>', code, flags=re.MULTILINE)
+
+            # Highlight functions
+            code = re.sub(r'(\w+)(\s*\()', r'<span style="color: #dcdcaa;">\1</span>\2', code)
+
+        elif language.lower() in ["javascript", "js", "typescript", "ts"]:
+            keywords = ['function', 'const', 'let', 'var', 'if', 'else', 'for', 'while',
+                       'return', 'import', 'export', 'from', 'class', 'new', 'this', 'try',
+                       'catch', 'finally', 'async', 'await', 'true', 'false', 'null', 'undefined']
+
+            code = html.escape(code)
+
+            for kw in keywords:
+                pattern = r'\b' + kw + r'\b'
+                code = re.sub(pattern, f'<span style="color: #569cd6;">{kw}</span>', code)
+
+            code = re.sub(r'(".*?")', r'<span style="color: #ce9178;">\1</span>', code)
+            code = re.sub(r"('.*?')", r'<span style="color: #ce9178;">\1</span>', code)
+            code = re.sub(r'(`.*?`)', r'<span style="color: #ce9178;">\1</span>', code)
+            code = re.sub(r'(//.*)$', r'<span style="color: #6a9955;">\1</span>', code, flags=re.MULTILINE)
+
+        else:
+            # Generic highlighting
+            code = html.escape(code)
+            code = re.sub(r'(".*?")', r'<span style="color: #ce9178;">\1</span>', code)
+            code = re.sub(r"('.*?')", r'<span style="color: #ce9178;">\1</span>', code)
+
+        return code
+
     # --- System Tray ---
     def _make_tray_icon(self) -> QIcon:
-        """Draw a neon green ⚡ lightning bolt on a dark square — no external image needed."""
+        """Draw a neon green  lightning bolt on a dark square — no external image needed."""
         size = 64
         px = QPixmap(size, size)
         px.fill(QColor(20, 20, 20, 255))  # Dark background
@@ -199,12 +437,12 @@ class UIOverlay(QWidget):
             QMenu::separator { height:1px; background:#444; margin:4px 0; }
         """)
 
-        show_action = menu.addAction("⚡  Show / Hide Overlay")
+        show_action = menu.addAction("  Show / Hide Overlay")
         show_action.triggered.connect(self._toggle_visibility)
 
         menu.addSeparator()
 
-        quit_action = menu.addAction("✕  Quit Interview Copilot")
+        quit_action = menu.addAction("  Quit Interview Copilot")
         quit_action.triggered.connect(QApplication.instance().quit)
 
         self.tray.setContextMenu(menu)
@@ -312,9 +550,33 @@ class UIOverlay(QWidget):
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
     # --- Methods to Update the UI ---
-    def update_text(self, text):
-        """Thread safe command to update the text."""
-        self.signals.update_text.emit(text)
+    def set_typing_indicator(self, visible: bool):
+        """Show/hide a subtle 'Copilot is thinking...' indicator."""
+        self.signals.set_typing_indicator.emit(visible)
+
+    def _set_typing_indicator(self, visible: bool):
+        """Internal method to update typing indicator visibility."""
+        if visible:
+            self.typing_indicator.setText("Copilot is thinking...")
+            self.typing_indicator.show()
+        else:
+            self.typing_indicator.hide()
+
+    def update_text(self, text: str, question_type: str = "generic", is_streaming: bool = False):
+        """
+        Thread-safe command to update the text with optional formatting.
+
+        Args:
+            text: The text content to display
+            question_type: Type of question ("star", "technical", "code", "generic")
+            is_streaming: If True, show ' Generating...' indicator
+        """
+        formatted_text = self.format_structured_answer(text, question_type)
+
+        if is_streaming:
+            formatted_text += '<div style="color: #00fa9a; font-style: italic; margin-top: 8px; font-size: 12px;"> Generating...</div>'
+
+        self.signals.update_text.emit(formatted_text)
 
     def _set_text(self, text):
         self.text_label.setText(text)
@@ -330,5 +592,3 @@ def create_app():
     if not app:
         app = QApplication(sys.argv)
     return app
-
-
