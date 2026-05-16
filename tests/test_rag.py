@@ -85,6 +85,25 @@ class TestRAGManagerIngest(unittest.TestCase):
             os.unlink(path)
 
 
+    def test_ingest_additional_context_markdown_files(self):
+        """Markdown files next to portfolio.md are included as interview context."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            portfolio = os.path.join(tmpdir, "portfolio.md")
+            job_context = os.path.join(tmpdir, "interview_context.md")
+            with open(portfolio, "w", encoding="utf-8") as f:
+                f.write("I built cloud infrastructure with Terraform and AWS.\n")
+            with open(job_context, "w", encoding="utf-8") as f:
+                f.write("Target role requires Kubernetes, Linux, and incident response.\n")
+
+            rag = _make_rag()
+            rag.data_path = portfolio
+            rag.ingest_portfolio()
+
+            self.assertEqual(rag.collection.count(), 2)
+            result = rag.retrieve_context("Kubernetes incident response", n_results=1)
+            self.assertIn("interview_context.md", result)
+
+
 class TestRAGManagerRetrieval(unittest.TestCase):
     """Tests for context retrieval and similarity filtering."""
 

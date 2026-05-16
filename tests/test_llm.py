@@ -70,6 +70,15 @@ class TestModelRouter(unittest.TestCase):
         model, _ = self.llm._route_model("")
         self.assertEqual(model, "llama-3.1-8b-instant")
 
+    def test_groq_backup_key_adds_backup_attempts(self):
+        """A second Groq key can be used after the primary Groq fallback chain."""
+        backup_client = AsyncMock()
+        self.llm.groq_backup_client = backup_client
+
+        attempts = self.llm._model_attempts("llama-3.3-70b-versatile")
+
+        self.assertIn((backup_client, "groq_backup", "llama-3.1-8b-instant"), attempts)
+
 
 class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
     """Tests for generate_answer with fully mocked Groq API."""
@@ -102,6 +111,58 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
         result = await self.llm.generate_answer(["[INTERVIEWER]: test"], "context")
         self.assertIn("Error", result)
 
+    async def test_generate_answer_rate_limit_uses_fallback_model(self):
+        """A Groq 429 should retry on the configured fallback model."""
+        fallback_choice = MagicMock()
+        fallback_choice.message.content = "Fallback answer."
+        fallback_response = MagicMock()
+        fallback_response.choices = [fallback_choice]
+        self.llm.client.chat.completions.create = AsyncMock(
+            side_effect=[Exception("429 rate_limit_exceeded tokens per day"), fallback_response]
+        )
+
+        result = await self.llm.generate_answer(
+            ["[INTERVIEWER]: Explain AWS VPC design."],
+            "context",
+            question_type="technical"
+        )
+
+        self.assertEqual(result, "Fallback answer.")
+        calls = self.llm.client.chat.completions.create.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "llama-3.3-70b-versatile")
+        self.assertEqual(calls[1].kwargs["model"], "llama-3.1-8b-instant")
+
+    async def test_generate_answer_nvidia_failure_uses_groq_fallback_client(self):
+        """Non-Groq primary providers should fall back to the Groq fallback client."""
+        primary_client = AsyncMock()
+        fallback_client = AsyncMock()
+
+        fallback_choice = MagicMock()
+        fallback_choice.message.content = "Groq fallback answer."
+        fallback_response = MagicMock()
+        fallback_response.choices = [fallback_choice]
+
+        primary_client.chat.completions.create = AsyncMock(side_effect=Exception("timeout"))
+        fallback_client.chat.completions.create = AsyncMock(return_value=fallback_response)
+
+        self.llm.provider = "nvidia"
+        self.llm.client = primary_client
+        self.llm.fallback_client = fallback_client
+
+        result = await self.llm.generate_answer(
+            ["[INTERVIEWER]: Explain AWS VPC design."],
+            "context",
+            question_type="technical"
+        )
+
+        self.assertEqual(result, "Groq fallback answer.")
+        primary_client.chat.completions.create.assert_awaited_once()
+        fallback_client.chat.completions.create.assert_awaited_once()
+        self.assertEqual(
+            fallback_client.chat.completions.create.call_args.kwargs["model"],
+            "llama-3.1-8b-instant"
+        )
+
     async def test_generate_answer_regen_higher_temperature(self):
         """generate_answer_regen should call the API with temperature >= 0.5."""
         await self.llm.generate_answer_regen(
@@ -123,6 +184,54 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
         call_args = self.llm.client.chat.completions.create.call_args.kwargs
         user_msg = call_args["messages"][-1]["content"]
         self.assertIn("SKIP", user_msg)  # The instruction is in the prompt
+
+
+class TestTurnClassification(unittest.IsolatedAsyncioTestCase):
+    """Tests for conversational turn-taking classification."""
+
+    async def asyncSetUp(self):
+        with patch("core.llm.AsyncGroq"):
+            self.llm = LLMClient()
+        self.llm.client = None
+
+    async def test_turn_classifier_skips_filler_without_api(self):
+        result = await self.llm.classify_turn("okay")
+        self.assertEqual(result["intent"], "filler")
+        self.assertFalse(result["should_answer_now"])
+
+    async def test_turn_classifier_waits_for_incomplete_question_without_api(self):
+        result = await self.llm.classify_turn("Can you explain AWS deployment with")
+        self.assertEqual(result["intent"], "incomplete")
+        self.assertFalse(result["should_answer_now"])
+
+    async def test_turn_classifier_detects_followup_without_api(self):
+        result = await self.llm.classify_turn(
+            "What if the deployment fails halfway?",
+            previous_question="How do you design a CI/CD pipeline?"
+        )
+        self.assertEqual(result["intent"], "followup")
+        self.assertTrue(result["should_answer_now"])
+
+    async def test_turn_classifier_parses_json_api_response(self):
+        mock_choice = MagicMock()
+        mock_choice.message.content = (
+            '{"intent":"interruption","should_answer_now":true,'
+            '"confidence":0.92,"clean_question":"Why Terraform instead of CloudFormation?"}'
+        )
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        self.llm.client = AsyncMock()
+        self.llm.client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+        result = await self.llm.classify_turn(
+            "Why Terraform instead of CloudFormation?",
+            previous_question="Explain your AWS IaC approach.",
+            was_answering=True
+        )
+
+        self.assertEqual(result["intent"], "interruption")
+        self.assertTrue(result["should_answer_now"])
+        self.assertEqual(result["clean_question"], "Why Terraform instead of CloudFormation?")
 
 
 class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
@@ -198,6 +307,69 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
             self.fail(f"Stream raised instead of yielding error: {e}")
 
         self.assertTrue(any("Error" in t for t in tokens))
+
+    async def test_stream_rate_limit_uses_fallback_model(self):
+        """Streaming retries on fallback model when the primary model hits a 429."""
+        chunks = self._make_stream_chunks(["Fallback", " stream"])
+
+        async def mock_stream():
+            for c in chunks:
+                yield c
+
+        self.llm.client = AsyncMock()
+        self.llm.client.chat.completions.create = AsyncMock(
+            side_effect=[Exception("429 rate_limit_exceeded tokens per day"), mock_stream()]
+        )
+
+        result = ""
+        async for token in self.llm.generate_answer_stream(
+            ["[INTERVIEWER]: Explain AWS VPC design."],
+            "context",
+            question_type="technical"
+        ):
+            result += token
+
+        self.assertEqual(result, "Fallback stream")
+        calls = self.llm.client.chat.completions.create.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "llama-3.3-70b-versatile")
+        self.assertEqual(calls[1].kwargs["model"], "llama-3.1-8b-instant")
+
+    async def test_stream_nvidia_failure_uses_groq_backup_client(self):
+        """If primary and first Groq fallback fail, stream retries with the backup Groq key."""
+        chunks = self._make_stream_chunks(["Groq", " fallback"])
+
+        async def mock_stream():
+            for c in chunks:
+                yield c
+
+        primary_client = AsyncMock()
+        fallback_client = AsyncMock()
+        backup_client = AsyncMock()
+        primary_client.chat.completions.create = AsyncMock(side_effect=Exception("connection timeout"))
+        fallback_client.chat.completions.create = AsyncMock(side_effect=Exception("429 rate_limit_exceeded"))
+        backup_client.chat.completions.create = AsyncMock(return_value=mock_stream())
+
+        self.llm.provider = "nvidia"
+        self.llm.client = primary_client
+        self.llm.fallback_client = fallback_client
+        self.llm.groq_backup_client = backup_client
+
+        result = ""
+        async for token in self.llm.generate_answer_stream(
+            ["[INTERVIEWER]: Explain AWS VPC design."],
+            "context",
+            question_type="technical"
+        ):
+            result += token
+
+        self.assertEqual(result, "Groq fallback")
+        primary_client.chat.completions.create.assert_awaited_once()
+        fallback_client.chat.completions.create.assert_awaited_once()
+        backup_client.chat.completions.create.assert_awaited_once()
+        self.assertEqual(
+            backup_client.chat.completions.create.call_args.kwargs["model"],
+            "llama-3.3-70b-versatile"
+        )
 
 
 if __name__ == "__main__":

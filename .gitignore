@@ -16,6 +16,9 @@ data/chroma_db/
 chroma.sqlite3
 interview_session.log
 interview_session.log.*
+graphify-out/
+overlay*_sample*.png
+*.pdf
 # Runtime session state (auto-generated)
 # Virtual environments
 venv/

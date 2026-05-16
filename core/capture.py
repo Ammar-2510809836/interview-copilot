@@ -40,6 +40,12 @@ class CaptureEngine:
         Starts audio streams and pushes audio chunks to the queue with speaker tags.
         Pushes tuples of: (tag, raw_audio_data, sample_rate, channels)
         """
+        def safe_put(queue, item):
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                logger.warning("Audio queue full! Dropping chunk to prevent crash.")
+
         self.p = pyaudio.PyAudio()
         self.is_running = True
         loop = asyncio.get_running_loop()
@@ -57,7 +63,7 @@ class CaptureEngine:
             if self.is_running and in_data:
                 # Push to asyncio queue from pyaudio callback thread
                 loop.call_soon_threadsafe(
-                    audio_queue.put_nowait, 
+                    safe_put, audio_queue,
                     ("[INTERVIEWER]", in_data, sys_rate, sys_channels)
                 )
             return (None, pyaudio.paContinue)
@@ -81,7 +87,7 @@ class CaptureEngine:
         def mic_callback(in_data, frame_count, time_info, status):
             if self.is_running and in_data:
                 loop.call_soon_threadsafe(
-                    audio_queue.put_nowait, 
+                    safe_put, audio_queue,
                     ("[ME]", in_data, mic_rate, mic_channels)
                 )
             return (None, pyaudio.paContinue)

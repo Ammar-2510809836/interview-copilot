@@ -1,19 +1,103 @@
 import os
 import logging
+import json
+import re
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+classification_prompt = """Classify this interview transcript fragment.
+
+Return only one word from this set:
+behavioral, technical, coding, followup, filler
+
+Important:
+- Cloud, Linux, DevOps, infrastructure, security, networking, databases, programming, debugging, troubleshooting, system design, tools, and command questions are technical.
+- Questions asking "why" about a technical design, tool choice, trade-off, incident, command, architecture, or implementation are technical, not behavioral.
+- Only use behavioral for HR/personal experience prompts like "tell me about a time", "conflict", "strength", "weakness", "motivation", "salary", or "why this role".
+
+Question:
+{question}
+"""
+
+turn_classification_prompt = """You classify real-time AI interview transcript turns.
+
+The interviewer may speak conversationally, pause mid-question, interrupt the candidate, or ask short follow-ups.
+
+Return ONLY valid JSON with these keys:
+- intent: one of "new_question", "followup", "continuation", "filler", "interruption", "incomplete"
+- should_answer_now: boolean
+- confidence: number from 0 to 1
+- clean_question: string
+
+Rules:
+- Use "filler" for acknowledgements like okay, right, thanks, good, yes with no question.
+- Use "incomplete" when the text ends mid-thought or needs more words to make sense.
+- Use "followup" for short contextual questions like "why?", "how so?", "what about rollback?", or references to prior answers.
+- Use "continuation" when the interviewer resumed and the new text completes the same question.
+- Use "interruption" when the interviewer cuts in while the candidate/copilot was answering and asks a different point.
+- should_answer_now is false for filler and incomplete.
+
+Recent conversation:
+{history}
+
+Previous answered question:
+{previous_question}
+
+Current accumulated interviewer text:
+{current_text}
+"""
 
 class LLMClient:
     """
     Anti-hallucination LLM brain strictly generating 30-word bullet points.
+    Supports multiple providers: Groq and NVIDIA NIM.
     """
     def __init__(self):
-        self.api_key = os.getenv("GROQ_API_KEY")
-        if not self.api_key:
-            logger.warning("GROQ_API_KEY not found in environment!")
-        self.client = AsyncGroq(api_key=self.api_key) if self.api_key else None
-        self.model = "llama-3.3-70b-versatile"
+        self.provider = os.getenv("LLM_PROVIDER", "groq").lower()
+        self.groq_key = os.getenv("GROQ_API_KEY")
+        self.groq_backup_key = os.getenv("GROQ_BACKUP_API_KEY")
+        self.nvidia_key = os.getenv("NVIDIA_API_KEY")
+        self.client = None
+        self.fallback_client = None
+        self.groq_backup_client = None
+
+        # Dynamic Model Selection from .env
+        self.groq_tech_model = os.getenv("GROQ_TECHNICAL_MODEL", "llama-3.3-70b-versatile")
+        self.groq_behavior_model = os.getenv("GROQ_BEHAVIORAL_MODEL", "llama-3.1-8b-instant")
+        self.groq_backup_tech_model = os.getenv("GROQ_BACKUP_TECHNICAL_MODEL", self.groq_tech_model)
+        self.groq_backup_behavior_model = os.getenv("GROQ_BACKUP_BEHAVIORAL_MODEL", self.groq_behavior_model)
+
+        self.nvidia_tech_model = os.getenv("NVIDIA_TECHNICAL_MODEL", "meta/llama-3.3-70b-instruct")
+        self.nvidia_behavior_model = os.getenv("NVIDIA_BEHAVIORAL_MODEL", "meta/llama-3.1-8b-instruct")
+
+        if self.provider == "nvidia":
+            if not self.nvidia_key:
+                logger.warning("NVIDIA_API_KEY not found in environment! Falling back to Groq.")
+                self.provider = "groq"
+            else:
+                logger.info(f"LLM Provider: NVIDIA NIM (Tech: {self.nvidia_tech_model})")
+                self.client = AsyncOpenAI(
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    api_key=self.nvidia_key
+                )
+
+        if self.provider == "groq":
+            if not self.groq_key:
+                logger.warning("GROQ_API_KEY not found in environment!")
+            logger.info(f"LLM Provider: Groq (Tech: {self.groq_tech_model})")
+            self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
+
+        if self.provider not in {"groq", "nvidia"}:
+            logger.warning("Unsupported LLM_PROVIDER=%s; falling back to Groq.", self.provider)
+            self.provider = "groq"
+            self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
+
+        if self.provider != "groq" and self.groq_key:
+            self.fallback_client = AsyncGroq(api_key=self.groq_key)
+        if self.groq_backup_key:
+            self.groq_backup_client = AsyncGroq(api_key=self.groq_backup_key)
         
         self.system_prompt = """You are acting AS the candidate in a real technical interview. You speak in **first person** as the candidate — "I", "my", "I've", "In my experience". You are NOT a coach giving tips.
 
@@ -23,6 +107,12 @@ class LLMClient:
 3. Start with substance immediately. Jump straight into the answer.
 4. NEVER say "you should...", "candidates should...", or "it's important to...". Use ONLY "I", "my", "I've".
 5. Format DYNAMICALLY based on question type (see below). Adapt to what fits best.
+6. NEVER use STAR format for technical, architecture, troubleshooting, command, coding, cloud, Linux, DevOps, security, networking, database, or tool-comparison questions. Answer those directly.
+7. If the transcript is incomplete, interrupted, or only conversational filler, reply exactly with "SKIP".
+8. For follow-up questions, answer the new question directly using the previous answer as context.
+9. Do not answer an earlier question if the interviewer has already moved to a newer question.
+10. Keep answers concise but complete: 3-6 sentences or 3-5 bullet points max.
+11. Prefer answer cards over paragraphs: direct answer, key bullets, concrete proof/example, and optional verification/follow-up.
 6. Keep answers concise but complete — 3-6 sentences or 3-5 bullet points max.
 
 ---
@@ -30,7 +120,9 @@ class LLMClient:
 ## QUESTION TYPE DETECTION & FORMATTING
 
 ### TYPE A: BEHAVIORAL/HR QUESTIONS (Use STAR Method automatically)
-**Detect:** "Tell me about a time...", "Give me an example...", "How do you handle...", "Describe a situation...", "What would you do if...", "Why", "What motivates you", "Strengths/weaknesses", "Salary", "Availability"
+**Detect:** "Tell me about a time...", "Give me an example...", "How do you handle conflict...", "Describe a situation...", "What would you do if a teammate...", "What motivates you", "Strengths/weaknesses", "Salary", "Availability", "Why this role/company"
+
+Do NOT classify technical "why" questions as behavioral. "Why use Multi-AZ?", "Why Terraform?", "Why did the health check fail?", "Why is this route table needed?", "Why use an index?", and "Why choose Kafka over SQS?" are technical.
 
 **MUST USE STAR FORMAT:**
 - **Situation:** Brief context (1 sentence)
@@ -63,6 +155,59 @@ class LLMClient:
 • **Generation:** LLM synthesizes an answer grounded in that context
 
 I implemented this in my AI Copilot project — used ChromaDB for vectors and saw 40% fewer hallucinations on technical questions."
+
+### UNIVERSAL ANSWER CARD
+Unless the question explicitly requires a long answer, structure responses as:
+1. Direct answer in one sentence
+2. 2-4 bullets with concrete details
+3. One proof point from portfolio/context when relevant
+4. Optional final sentence for trade-off, risk, or verification
+
+Do not show these labels unless they help. Make it sound natural to say aloud.
+
+### TECHNICAL INTERVIEW ANSWER QUALITY RULES
+For technical interviews, lead with the exact answer first, then add 2-4 precise bullets. Avoid generic setup sentences. Every answer should include at least one concrete command, configuration field, service behavior, trade-off, or example when applicable.
+
+**Comparison questions must use this structure:**
+â€¢ One-sentence direct contrast
+â€¢ 2-4 bullets covering behavior, scope, trade-off, and when I would use each
+â€¢ If the distinction affects operations, mention the failure mode or practical consequence
+
+**Troubleshooting questions must use this structure:**
+â€¢ Start with the first exact command/check I would run
+â€¢ Then explain the next 2-3 checks in order
+â€¢ End with the likely fix and how I would verify it
+
+**Architecture/system design questions must use this structure:**
+â€¢ State the baseline design in one sentence
+â€¢ Cover compute, data/storage, networking, security, observability, scaling, and cost only as relevant
+â€¢ Mention one risk/trade-off and one mitigation
+
+**Infrastructure-as-Code questions must be concrete:**
+â€¢ Mention modules/components, variables/parameters, environment separation, state/backend strategy, review/plan/apply flow, and drift prevention when relevant
+
+**Command/script questions must be command-first:**
+â€¢ Give the exact command or minimal script before explanation
+â€¢ Prefer modern commands, then mention legacy fallback only if useful
+â€¢ Include validation command or expected output cue
+
+**Security Group vs Network ACL must include:**
+â€¢ Security Groups are stateful, attached to ENIs/instances, allow-only rules with implicit deny, and return traffic is automatically allowed
+â€¢ Network ACLs are stateless, subnet-level, ordered numbered rules, support allow and explicit deny, and inbound/outbound return paths must both be allowed
+â€¢ Use Security Groups for workload-level access; use NACLs for coarse subnet guardrails or explicit subnet-level blocks
+
+**Linux port/process troubleshooting must start command-first:**
+â€¢ `sudo ss -tlnp | grep ':443'` as the modern first command
+â€¢ fallback: `sudo lsof -iTCP:443 -sTCP:LISTEN -P -n`
+â€¢ map PID to service with `systemctl status <PID>` or inspect `ps -fp <PID>`, then restart with `sudo systemctl restart <service>`
+â€¢ verify with `sudo systemctl status <service>` and rerun `ss`
+
+**Terraform/IaC answers must include concrete structure:**
+â€¢ reusable modules for VPC/EC2/RDS, per-environment `*.tfvars`, isolated state/backends, and clear variable names like `vpc_cidr`, `instance_type`, `environment`
+â€¢ for security group rules, mention inline rules are simple but harder to manage at scale; separate `aws_security_group_rule` resources improve change tracking but need careful lifecycle ownership
+
+**CloudFormation environment answers must include:**
+â€¢ `Parameters` for values supplied at deploy time, `Mappings` for controlled environment lookups, `Conditions` for optional resources, and example parameter names like `VpcCidr` and `InstanceType`
 
 ### TYPE C: CODING/ALGORITHM QUESTIONS
 **Detect:** "Write code", "Implement", "Solve", "Algorithm", "Function", "Optimize this", "Debug"
@@ -136,31 +281,159 @@ I implemented this in my AI Copilot project — used ChromaDB for vectors and sa
         'rag', 'llm', 'vector', 'embedding', 'model', 'train', 'neural',
         'complexity', 'optimize', 'cache', 'load balanc', 'distributed',
         'security', 'encrypt', 'auth', 'token', 'jwt', 'oauth',
+        'iam', 'role', 'user', 'policy', 's3', 'ec2', 'rds', 'alb',
+        'vpc', 'subnet', 'cidr', 'route table', 'nat', 'nacl', 'acl',
+        'security group', 'cloudformation', 'parameter', 'mapping',
+        'linux', 'systemctl', 'systemd', 'netstat', 'ss', 'lsof', 'port',
+        'server', 'process', 'service', 'socket', 'firewall', 'load balancer',
+        'dns', 'tls', 'ssl', 'certificate', 'nginx', 'apache', 'database',
+        'postgres', 'mysql', 'index', 'query', 'replica', 'backup', 'restore',
+        'redis', 'queue', 'kafka', 'sqs', 'sns', 'event', 'message',
+        'terraform', 'ansible', 'cloudformation', 'cdk', 'jenkins',
+        'github actions', 'gitlab', 'prometheus', 'grafana', 'elk',
+        'observability', 'monitoring', 'logging', 'alerting', 'incident',
+        'kubernetes', 'pod', 'deployment', 'service', 'ingress', 'helm',
     }
+
+    def _has_technical_keyword(self, text_lower: str) -> bool:
+        """Match technical routing terms without short-token false positives."""
+        for kw in self.TECHNICAL_KEYWORDS:
+            if len(kw) <= 3 or kw.replace("-", "").isalnum():
+                if re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", text_lower):
+                    return True
+            elif kw in text_lower:
+                return True
+        return False
 
     def _route_model(self, question_text: str, question_type: str = None) -> tuple[str, int]:
         """
-        Route to fast (8b) or powerful (70b) model based on question content.
+        Route to fast or powerful model based on question content and provider.
         Returns (model_name, max_tokens).
         """
-        if question_type:
-            if question_type == "coding":
-                return "llama-3.3-70b-versatile", 600
-            elif question_type == "technical":
-                return "llama-3.3-70b-versatile", 400
-            elif question_type in ["behavioral", "followup"]:
-                return "llama-3.1-8b-instant", 300
-            else:
-                return "llama-3.1-8b-instant", 250
+        if self.provider == "nvidia":
+            # NVIDIA NIM model mapping
+            if question_type:
+                if question_type in ["coding", "technical"]:
+                    return self.nvidia_tech_model, 500
+                else:
+                    return self.nvidia_behavior_model, 300
 
-        text_lower = question_text.lower()
-        is_technical = any(kw in text_lower for kw in self.TECHNICAL_KEYWORDS)
-        if is_technical:
-            logger.info("Router: Technical question → llama-3.3-70b-versatile")
-            return "llama-3.3-70b-versatile", 400
+            text_lower = question_text.lower()
+            is_technical = self._has_technical_keyword(text_lower)
+            if is_technical:
+                return self.nvidia_tech_model, 500
+            else:
+                return self.nvidia_behavior_model, 300
         else:
-            logger.info("Router: Behavioral/HR question → llama-3.1-8b-instant")
-            return "llama-3.1-8b-instant", 250
+            # Groq model mapping
+            if question_type:
+                if question_type == "coding":
+                    return self.groq_tech_model, 600
+                elif question_type == "technical":
+                    return self.groq_tech_model, 400
+                elif question_type in ["behavioral", "followup"]:
+                    return self.groq_behavior_model, 300
+                else:
+                    return self.groq_behavior_model, 250
+
+            text_lower = question_text.lower()
+            is_technical = self._has_technical_keyword(text_lower)
+            if is_technical:
+                logger.info(f"Router: Technical question → {self.groq_tech_model}")
+                return self.groq_tech_model, 400
+            else:
+                logger.info(f"Router: Behavioral/HR question → {self.groq_behavior_model}")
+                return self.groq_behavior_model, 250
+
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Detect provider quota/rate-limit failures from SDK exceptions."""
+        error_text = str(error).lower()
+        return any(
+            marker in error_text
+            for marker in (
+                "429",
+                "too many requests",
+                "rate limit",
+                "rate_limit",
+                "rate_limit_exceeded",
+                "tokens per day",
+                "tokens per minute",
+            )
+        )
+
+    def _is_retryable_llm_error(self, error: Exception) -> bool:
+        """Detect failures worth retrying on the emergency fallback provider."""
+        error_text = str(error).lower()
+        return self._is_rate_limit_error(error) or any(
+            marker in error_text
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection",
+                "connecterror",
+                "service unavailable",
+                "503",
+                "502",
+                "500",
+            )
+        )
+
+    def _fallback_models(self) -> list[str]:
+        """Return primary Groq fallback models used when any provider fails."""
+        configured = os.getenv("GROQ_FALLBACK_MODELS", "")
+        fallback_models = [m.strip() for m in configured.split(",") if m.strip()]
+        if self.groq_behavior_model:
+            fallback_models.append(self.groq_behavior_model)
+
+        models = []
+        for model in fallback_models:
+            if model not in models:
+                models.append(model)
+        return models
+
+    def _backup_groq_models(self, primary_model: str) -> list[str]:
+        """Return fallback models for the second Groq key."""
+        configured = os.getenv("GROQ_BACKUP_FALLBACK_MODELS", "")
+        fallback_models = [m.strip() for m in configured.split(",") if m.strip()]
+        fallback_models.extend([
+            self.groq_backup_tech_model,
+            self.groq_backup_behavior_model,
+        ])
+
+        models = []
+        for model in fallback_models:
+            if model and model != primary_model and model not in models:
+                models.append(model)
+        return models
+
+    def _model_attempts(self, primary_model: str) -> list[tuple[object, str, str]]:
+        """
+        Return primary provider attempt plus Groq fallback attempts.
+        Each item is (client, provider_name, model).
+        """
+        attempts = [(self.client, self.provider, primary_model)]
+
+        groq_client = self.client if self.provider == "groq" else self.fallback_client
+        if groq_client:
+            for model in self._fallback_models():
+                if self.provider == "groq" and model == primary_model:
+                    continue
+                attempts.append((groq_client, "groq", model))
+
+        if self.groq_backup_client:
+            for model in self._backup_groq_models(primary_model):
+                attempts.append((self.groq_backup_client, "groq_backup", model))
+        return attempts
+
+    def _fallback_max_tokens(self, max_tokens: int) -> int:
+        """Use a shorter answer on fallback to reduce token pressure during interviews."""
+        configured = os.getenv("GROQ_FALLBACK_MAX_TOKENS")
+        if configured:
+            try:
+                return max(80, min(max_tokens, int(configured)))
+            except ValueError:
+                logger.warning("Invalid GROQ_FALLBACK_MAX_TOKENS=%s; using default.", configured)
+        return min(max_tokens, 350)
 
     async def classify_question(self, question_text: str) -> str:
         """
@@ -170,21 +443,11 @@ I implemented this in my AI Copilot project — used ChromaDB for vectors and sa
         if not self.client or len(question_text.strip()) < 3:
             return "behavioral"
 
-        classification_prompt = """Classify this interview question into ONE category:
-- behavioral: "Tell me about a time", "How do you handle", "Strengths/weaknesses", "Why this role"
-- technical: "Explain", "What is", "Compare", "Trade-offs", "How does X work"
-- coding: "Write code", "Implement", "Solve", "Algorithm", "Function", "Optimize"
-- followup: Starts with "But", "What if", "Why", "How would", references previous answer
-- filler: Just "okay", "right", "yes", "good" with no actual question
-
-Reply with ONLY the category word (behavioral/technical/coding/followup/filler).
-
-Question: {question}
-Category:"""
+        classification_model = self.nvidia_behavior_model if self.provider == "nvidia" else self.groq_behavior_model
 
         try:
             response = await self.client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=classification_model,
                 messages=[
                     {"role": "system", "content": "You are a question classifier. Reply with only one word."},
                     {"role": "user", "content": classification_prompt.format(question=question_text[:200])}
@@ -205,14 +468,117 @@ Category:"""
             logger.error(f"Question classification failed: {e}")
             return "behavioral"  # Safe fallback
 
-    async def generate_answer(self, transcript_history: list, rag_context: str, question_type: str = None, is_followup: bool = False, conversation_summary: str = "") -> str:
+    def _heuristic_turn_classification(self, current_text: str, previous_question: str = "", was_answering: bool = False) -> dict:
+        """Cheap local fallback for turn-taking when the LLM classifier is unavailable."""
+        text = (current_text or "").strip()
+        text_lower = text.lower()
+        words = text_lower.split()
+
+        filler_phrases = {
+            "yes", "yeah", "yep", "no", "okay", "ok", "right", "good",
+            "great", "thanks", "thank you", "hello", "hi", "nice"
+        }
+        if not text or text_lower in filler_phrases:
+            return {
+                "intent": "filler",
+                "should_answer_now": False,
+                "confidence": 0.85,
+                "clean_question": text,
+            }
+
+        dangling_words = {
+            "and", "or", "but", "because", "with", "using", "for", "to", "from",
+            "the", "a", "an", "that", "which", "when", "where", "if", "so",
+            "like", "about", "regarding", "into", "by", "of"
+        }
+        last_word = words[-1].rstrip(".,!?;:") if words else ""
+        if len(words) < 4 or last_word in dangling_words:
+            return {
+                "intent": "incomplete",
+                "should_answer_now": False,
+                "confidence": 0.75,
+                "clean_question": text,
+            }
+
+        followup_starters = (
+            "why", "how so", "what about", "what if", "but", "and why",
+            "can you elaborate", "could you explain", "you mentioned",
+            "that approach", "that solution", "how would", "would you"
+        )
+        if previous_question and any(text_lower.startswith(s) for s in followup_starters):
+            return {
+                "intent": "interruption" if was_answering else "followup",
+                "should_answer_now": True,
+                "confidence": 0.78,
+                "clean_question": text,
+            }
+
+        return {
+            "intent": "new_question",
+            "should_answer_now": True,
+            "confidence": 0.7,
+            "clean_question": text,
+        }
+
+    async def classify_turn(
+        self,
+        current_text: str,
+        transcript_history: list = None,
+        previous_question: str = "",
+        was_answering: bool = False
+    ) -> dict:
         """
-        Non-streaming fallback LLM call. Used internally and available as a
-        reliable synchronous-style alternative to generate_answer_stream.
-        Kept intentionally — useful for testing and as a fallback if streaming fails.
+        Classify whether the accumulated interviewer text is ready to answer.
+        This is separate from question type classification; it protects against
+        conversational pauses, filler, follow-ups, and interruptions.
+        """
+        fallback = self._heuristic_turn_classification(current_text, previous_question, was_answering)
+
+        if not self.client or len((current_text or "").strip()) < 3:
+            return fallback
+
+        model = self.nvidia_behavior_model if self.provider == "nvidia" else self.groq_behavior_model
+        history = "\n".join((transcript_history or [])[-8:])
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a strict JSON classifier for real-time interview turn-taking."},
+                    {"role": "user", "content": turn_classification_prompt.format(
+                        history=history[:1200],
+                        previous_question=(previous_question or "")[:400],
+                        current_text=(current_text or "")[:800],
+                    )}
+                ],
+                max_tokens=120,
+                temperature=0.0
+            )
+            raw = response.choices[0].message.content.strip()
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            data = json.loads(match.group(0) if match else raw)
+
+            intent = str(data.get("intent", fallback["intent"])).lower()
+            valid_intents = {"new_question", "followup", "continuation", "filler", "interruption", "incomplete"}
+            if intent not in valid_intents:
+                intent = fallback["intent"]
+
+            return {
+                "intent": intent,
+                "should_answer_now": bool(data.get("should_answer_now", fallback["should_answer_now"])),
+                "confidence": float(data.get("confidence", fallback["confidence"])),
+                "clean_question": str(data.get("clean_question") or current_text or "").strip(),
+            }
+        except Exception as e:
+            logger.error(f"Turn classification failed: {e}")
+            return fallback
+
+    async def generate_answer(self, transcript_history: list, rag_context: str, question_type: str = None, is_followup: bool = False, conversation_summary: str = "", max_tokens_override: int = None) -> str:
+        """
+        Non-streaming fallback LLM call.
         """
         if not self.client:
-            return "Error: Groq API Key missing."
+            return f"Error: {self.provider.upper()} API Key missing."
 
         # Auto-classify if not provided
         if not question_type and transcript_history:
@@ -238,35 +604,45 @@ Category:"""
 
         # Route to the right model based on question complexity
         model, max_tokens = self._route_model(recent_history.lower(), question_type)
+        if max_tokens_override:
+            max_tokens = max_tokens_override
 
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": "\n\n".join(context_parts)}
         ]
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.2
-            )
+        attempts = self._model_attempts(model)
+        for index, (attempt_client, attempt_provider, attempt_model) in enumerate(attempts):
+            attempt_max_tokens = max_tokens if index == 0 else self._fallback_max_tokens(max_tokens)
+            try:
+                if index > 0:
+                    logger.warning("Retrying LLM generation with %s fallback model: %s", attempt_provider, attempt_model)
+                response = await attempt_client.chat.completions.create(
+                    model=attempt_model,
+                    messages=messages,
+                    max_tokens=attempt_max_tokens,
+                    temperature=0.2
+                )
 
-            output = response.choices[0].message.content.strip()
-            return output
+                output = response.choices[0].message.content.strip()
+                return output
 
-        except Exception as e:
-            logger.error(f"LLM Generation failed: {e}")
-            return "Error generating response."
+            except Exception as e:
+                if self._is_retryable_llm_error(e) and index < len(attempts) - 1:
+                    logger.warning("LLM %s model %s failed; trying fallback. Error: %s", attempt_provider, attempt_model, e)
+                    continue
+                logger.error(f"LLM Generation failed: {e}")
+                return "Error generating response."
 
-    async def generate_answer_stream(self, transcript_history: list, rag_context: str, question_type: str = None, is_followup: bool = False, conversation_summary: str = ""):
+        return "Error generating response."
+
+    async def _generate_answer_stream_without_fallback(self, transcript_history: list, rag_context: str, question_type: str = None, is_followup: bool = False, conversation_summary: str = "", max_tokens_override: int = None):
         """
         Streaming version of generate_answer.
-        Async generator that yields text chunks as they arrive from the Groq API.
-        Yields '__SKIP__' sentinel string if LLM decides to skip.
         """
         if not self.client:
-            yield "Error: Groq API Key missing."
+            yield f"Error: {self.provider.upper()} API Key missing."
             return
 
         # Auto-classify if not provided
@@ -291,6 +667,8 @@ Category:"""
         context_parts.append("Generate your response now. If no [INTERVIEWER] question is present, reply exactly with 'SKIP'.")
 
         model, max_tokens = self._route_model(recent_history.lower(), question_type)
+        if max_tokens_override:
+            max_tokens = max_tokens_override
 
         messages = [
             {"role": "system", "content": self.system_prompt},
@@ -307,11 +685,13 @@ Category:"""
                 stream=True
             )
             async for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta:
                     accumulated += delta
                     # Early SKIP detection — if first tokens spell SKIP, abort
-                    if len(accumulated) <= 6 and "SKIP" in accumulated.strip():
+                    if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
                         yield "__SKIP__"
                         return
                     yield delta
@@ -320,11 +700,80 @@ Category:"""
             logger.error(f"LLM Stream failed: {e}")
             yield f"Error streaming response: {e}"
 
-    async def generate_answer_regen(self, transcript_history: list, rag_context: str, last_question: str = "", question_type: str = None, conversation_summary: str = "") -> str:
-        """Same as generate_answer but with higher temperature for a fresh, different take.
-        Never returns SKIP — always generates a new answer for the given question."""
+    async def generate_answer_stream(self, transcript_history: list, rag_context: str, question_type: str = None, is_followup: bool = False, conversation_summary: str = "", max_tokens_override: int = None):
+        """
+        Streaming version of generate_answer with automatic Groq fallback on rate limits.
+        """
         if not self.client:
-            return "Error: Groq API Key missing."
+            yield f"Error: {self.provider.upper()} API Key missing."
+            return
+
+        if not question_type and transcript_history:
+            last_interviewer = ""
+            for msg in reversed(transcript_history):
+                if msg.startswith("[INTERVIEWER]"):
+                    last_interviewer = msg.replace("[INTERVIEWER]: ", "").strip()
+                    break
+            question_type = await self.classify_question(last_interviewer)
+
+        recent_history = "\n".join(transcript_history[-15:])
+
+        context_parts = [f"Portfolio/Resume Context:\n{rag_context}"]
+        if conversation_summary:
+            context_parts.append(f"Conversation Summary:\n{conversation_summary}")
+        if is_followup:
+            context_parts.append("This is a FOLLOW-UP question. Build on your previous answer.")
+
+        context_parts.append(f"Recent Conversation:\n{recent_history}")
+        context_parts.append("Generate your response now. If no [INTERVIEWER] question is present, reply exactly with 'SKIP'.")
+
+        model, max_tokens = self._route_model(recent_history.lower(), question_type)
+        if max_tokens_override:
+            max_tokens = max_tokens_override
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": "\n\n".join(context_parts)}
+        ]
+
+        attempts = self._model_attempts(model)
+        for index, (attempt_client, attempt_provider, attempt_model) in enumerate(attempts):
+            attempt_max_tokens = max_tokens if index == 0 else self._fallback_max_tokens(max_tokens)
+            try:
+                accumulated = ""
+                if index > 0:
+                    logger.warning("Retrying LLM stream with %s fallback model: %s", attempt_provider, attempt_model)
+                stream = await attempt_client.chat.completions.create(
+                    model=attempt_model,
+                    messages=messages,
+                    max_tokens=attempt_max_tokens,
+                    temperature=0.2,
+                    stream=True
+                )
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        accumulated += delta
+                        if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
+                            yield "__SKIP__"
+                            return
+                        yield delta
+                return
+
+            except Exception as e:
+                if self._is_retryable_llm_error(e) and index < len(attempts) - 1:
+                    logger.warning("LLM stream %s model %s failed; trying fallback. Error: %s", attempt_provider, attempt_model, e)
+                    continue
+                logger.error(f"LLM Stream failed: {e}")
+                yield f"Error streaming response: {e}"
+                return
+
+    async def generate_answer_regen(self, transcript_history: list, rag_context: str, last_question: str = "", question_type: str = None, conversation_summary: str = "", max_tokens_override: int = None) -> str:
+        """Same as generate_answer but with higher temperature for a fresh, different take."""
+        if not self.client:
+            return f"Error: {self.provider.upper()} API Key missing."
 
         # Auto-classify if not provided
         if not question_type:
@@ -332,6 +781,8 @@ Category:"""
 
         recent_history = "\n".join(transcript_history[-15:])
         model, max_tokens = self._route_model((last_question + " " + recent_history).lower(), question_type)
+        if max_tokens_override:
+            max_tokens = max_tokens_override
 
         question_prompt = last_question if last_question else "the most recent interview question in the conversation"
 
@@ -347,17 +798,27 @@ Category:"""
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": "\n\n".join(context_parts)}
         ]
-        try:
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.6  # Higher temperature = different answer each regen
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"LLM Regen failed: {e}")
-            return "Error regenerating response."
+        attempts = self._model_attempts(model)
+        for index, (attempt_client, attempt_provider, attempt_model) in enumerate(attempts):
+            attempt_max_tokens = max_tokens if index == 0 else self._fallback_max_tokens(max_tokens)
+            try:
+                if index > 0:
+                    logger.warning("Retrying LLM regen with %s fallback model: %s", attempt_provider, attempt_model)
+                response = await attempt_client.chat.completions.create(
+                    model=attempt_model,
+                    messages=messages,
+                    max_tokens=attempt_max_tokens,
+                    temperature=0.6  # Higher temperature = different answer each regen
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                if self._is_retryable_llm_error(e) and index < len(attempts) - 1:
+                    logger.warning("LLM regen %s model %s failed; trying fallback. Error: %s", attempt_provider, attempt_model, e)
+                    continue
+                logger.error(f"LLM Regen failed: {e}")
+                return "Error regenerating response."
+
+        return "Error regenerating response."
 
 
     async def is_question_complete(self, text: str) -> bool:
@@ -398,9 +859,11 @@ Output: YES
 Text: Tell me about yourself.
 Output: YES'''
 
+        gating_model = self.nvidia_behavior_model if self.provider == "nvidia" else self.groq_behavior_model
+
         try:
             response = await self.client.chat.completions.create(
-                model="llama-3.1-8b-instant", # Ultra-fast model for gating
+                model=gating_model, # Ultra-fast model for gating
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Text: {text}\nOutput:"}

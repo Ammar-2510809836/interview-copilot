@@ -1,4 +1,4 @@
-# IMPORTANT: chromadb/onnxruntime must be imported BEFORE any PyQt6/qasync modules on Windows
+﻿# IMPORTANT: chromadb/onnxruntime must be imported BEFORE any PyQt6/qasync modules on Windows
 # to prevent DLL load order conflicts that cause "onnxruntime not installed" errors.
 import chromadb
 import onnxruntime
@@ -25,7 +25,7 @@ from ui.overlay import UIOverlay, create_app
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configure background session logger — rotates daily, keeps 7 days
+# Configure background session logger â€” rotates daily, keeps 7 days
 session_logger = logging.getLogger("session_recorder")
 session_logger.setLevel(logging.INFO)
 
@@ -53,6 +53,19 @@ regen_trigger_event = threading.Event()   # Ctrl+R
 
 async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_overlay):
     transcript_history = []
+    manual_question_queue = asyncio.Queue(maxsize=25)
+    loop = asyncio.get_running_loop()
+
+    def enqueue_manual_question(question: str):
+        def put_question():
+            try:
+                manual_question_queue.put_nowait(question)
+            except asyncio.QueueFull:
+                logger.warning("Manual question queue full; dropped pasted question.")
+
+        loop.call_soon_threadsafe(put_question)
+
+    ui_overlay.signals.manual_question_submitted.connect(enqueue_manual_question)
 
     interviewer_accumulator = []
     me_accumulator = []
@@ -156,7 +169,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         code_lang = line.strip()[3:].strip()
                         code_lines = []
                     else:
-                        # End of code block — render it
+                        # End of code block â€” render it
                         code_content = "\n".join(code_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
                         label = f"<span style='color:#aaaaaa; font-size:11px;'>{code_lang}</span><br>" if code_lang else ""
                         code_font = ui_overlay.CODE_FONT
@@ -179,13 +192,13 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                 line = re.sub(r'\*\*(.+?)\*\*', r"<b style='color:#ffffff;'>\1</b>", line)
                 line = re.sub(r'`([^`]+)`', r"<code style='background:#1a1a2e; color:#00fa9a; font-family:Consolas,monospace; padding:1px 4px; border-radius:3px;'>\1</code>", line)
 
-                # --- Bullet points: • or - at start ---
+                # --- Bullet points: â€¢ or - at start ---
                 stripped = line.strip()
-                if stripped.startswith("•") or (stripped.startswith("-") and len(stripped) > 2):
-                    content = stripped.lstrip("•- ").strip()
+                if stripped.startswith("â€¢") or (stripped.startswith("-") and len(stripped) > 2):
+                    content = stripped.lstrip("â€¢- ").strip()
                     html_lines.append(
                         f"<div style='margin:3px 0 3px 8px; color:#cccccc;'>"
-                        f"<span style='color:#00fa9a; font-weight:bold;'>▸</span>&nbsp;{content}</div>"
+                        f"<span style='color:#00fa9a; font-weight:bold;'>&rsaquo;</span>&nbsp;{content}</div>"
                     )
                 elif stripped == "":
                     html_lines.append("<br>")
@@ -214,15 +227,89 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                 advice_html = markdown_to_html(last_advice)
                 html += (
                     f"<div style='margin-top:4px;'>"
-                    f"<span style='color:#00fa9a; font-size:11px; font-weight:bold;'>⚡ COPILOT</span><br>"
+                    f"<span style='color:#00fa9a; font-size:11px; font-weight:bold;'>âš¡ COPILOT</span><br>"
                     f"{advice_html}</div>"
                 )
 
             ui_overlay.update_text(html)
         except Exception as e:
             logger.warning(f"update_ui failed: {e}")
-            ui_overlay.update_text("<span style='color:#ff6b6b;'>⚠ UI render error</span>")
+            ui_overlay.update_text("<span style='color:#ff6b6b;'>âš  UI render error</span>")
 
+
+    async def answer_manual_question(q_text: str):
+        """Answer a pasted question using the same context and style as live interview audio."""
+        nonlocal last_question, last_advice
+
+        q_text = (q_text or "").strip()
+        if not q_text:
+            return
+
+        last_question = q_text
+        last_advice = "<i style='color:#888888'>Copilot Thinking (Chat)...</i>"
+        transcript_history.append(f"[INTERVIEWER]: {q_text}")
+        if len(transcript_history) > 30:
+            transcript_history.pop(0)
+        session_logger.info(f"[CHAT QUESTION]: {q_text}")
+        update_ui()
+
+        q_type = await llm_client.classify_question(q_text)
+        is_followup = is_followup_question(q_text, conversation_state["previous_question"])
+
+        context = rag_manager.retrieve_context(q_text, conversation_history=transcript_history)
+        answer_clean = ""
+        skipped = False
+        batch_buffer = ""
+        BATCH_CHARS = 8
+
+        ui_overlay.set_typing_indicator(True)
+        try:
+            chat_max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1400"))
+        except ValueError:
+            chat_max_tokens = 1400
+        async for token in llm_client.generate_answer_stream(
+            transcript_history,
+            context,
+            question_type=q_type,
+            is_followup=is_followup,
+            conversation_summary=conversation_state["conversation_summary"],
+            max_tokens_override=chat_max_tokens
+        ):
+            if token == "__SKIP__":
+                skipped = True
+                break
+            answer_clean += token
+            batch_buffer += token
+            if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                ui_overlay.update_text(
+                    answer_clean.replace('<', '&lt;').replace('>', '&gt;'),
+                    question_type=q_type if q_type else "generic",
+                    is_streaming=True
+                )
+                batch_buffer = ""
+                await asyncio.sleep(0.03)
+
+        ui_overlay.set_typing_indicator(False)
+
+        if skipped:
+            last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
+        elif answer_clean.startswith("Error"):
+            last_advice = f"<span style='color:#ff6b6b'>Ã¢Å¡Â  {answer_clean}</span>"
+        elif answer_clean:
+            answer_clean = answer_clean.strip()
+            session_logger.info(f"[COPILOT ADVICE (CHAT)]:\n{answer_clean}\n" + "="*50)
+            last_advice = answer_clean
+            transcript_history.append(f"[COPILOT]: {answer_clean}")
+            if len(transcript_history) > 30:
+                transcript_history.pop(0)
+            conversation_state["current_question_type"] = q_type
+            conversation_state["previous_question"] = q_text
+            conversation_state["previous_answer"] = answer_clean
+            update_conversation_summary(q_text, answer_clean, q_type)
+        else:
+            last_advice = "<i style='color:#888888'>(No answer generated)</i>"
+
+        update_ui()
 
     # Set of words that indicate a sentence is cut off mid-thought
     # If the accumulated text ends with one of these, keep listening
@@ -252,6 +339,16 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
     while True:
         try:
+            # --- MANUAL CHAT INPUT ---
+            # Pasted questions from the overlay use the same answer pipeline as live audio.
+            try:
+                pasted_question = manual_question_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pasted_question = None
+            if pasted_question:
+                await answer_manual_question(pasted_question)
+                continue
+
             # --- MANUAL HOTKEY TRIGGER ---
             # Check if Ctrl+Shift+Space was pressed. If so, bypass all gates immediately.
             if manual_trigger_event.is_set():
@@ -295,7 +392,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                             last_advice = "<i style='color:#888888'>(No answer generated)</i>"
                     except Exception as e:
                         logger.error(f"Manual trigger failed: {e}")
-                        last_advice = "<i style='color:#ff6b6b'>⚠ Manual trigger error — check logs</i>"
+                        last_advice = "<i style='color:#ff6b6b'>âš  Manual trigger error â€” check logs</i>"
                     update_ui()
 
                 continue
@@ -334,14 +431,31 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                             last_advice = "<i style='color:#888888'>(No regenerated answer)</i>"
                     except Exception as e:
                         logger.error(f"Regen failed: {e}")
-                        last_advice = "<i style='color:#ff6b6b'>⚠ Regeneration error — check logs</i>"
+                        last_advice = "<i style='color:#ff6b6b'>âš  Regeneration error â€” check logs</i>"
                     update_ui()
                 continue
 
             try:
                 # Wait for incoming transcriptions.
-                # 3.5s timeout — long enough for natural interviewer pauses between sentences.
-                tag, sentence = await asyncio.wait_for(transcription_engine.text_queue.get(), timeout=3.5)
+                # 3.5s timeout â€” long enough for natural interviewer pauses between sentences.
+                transcript_task = asyncio.create_task(transcription_engine.text_queue.get())
+                manual_task = asyncio.create_task(manual_question_queue.get())
+                done, pending = await asyncio.wait(
+                    {transcript_task, manual_task},
+                    timeout=3.5,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+
+                if not done:
+                    raise asyncio.TimeoutError
+
+                if manual_task in done:
+                    await answer_manual_question(manual_task.result())
+                    continue
+
+                tag, sentence = transcript_task.result()
                 
                 # Log everything to background session file
                 session_logger.info(f"{tag}: {sentence}")
@@ -438,12 +552,40 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                                 continue
                             elif tag2 == "[ME]":
                                 me_accumulator.append(sentence2)
-                                # User started speaking during cooldown — generate answer NOW
+                                # User started speaking during cooldown â€” generate answer NOW
                                 logger.info("Cooldown: User started speaking. Generating answer immediately.")
                         except asyncio.TimeoutError:
-                            # 3.0s of confirmed silence after gates passed — commit to answer
+                            # 3.0s of confirmed silence after gates passed â€” commit to answer
                             logger.info("Cooldown: Confirmed silence. Generating answer.")
                         
+                    turn = await llm_client.classify_turn(
+                        q_text,
+                        transcript_history=transcript_history,
+                        previous_question=conversation_state["previous_question"],
+                        was_answering=False
+                    )
+                    logger.info(
+                        "Turn classifier: intent=%s answer_now=%s confidence=%.2f",
+                        turn.get("intent"),
+                        turn.get("should_answer_now"),
+                        turn.get("confidence", 0.0)
+                    )
+
+                    if not turn.get("should_answer_now", False):
+                        intent = turn.get("intent")
+                        if intent == "filler":
+                            logger.info("Turn classifier: conversational filler. Clearing interviewer buffer.")
+                            interviewer_accumulator.clear()
+                            interviewer_start_time = None
+                            last_question = ""
+                            last_advice = "<i style='color:#888888'>(Listening)</i>"
+                            update_ui()
+                        else:
+                            logger.info("Turn classifier: interviewer turn is incomplete. Continuing to listen.")
+                        continue
+
+                    q_text = turn.get("clean_question") or q_text
+
                     # Save the full question before clearing, so we can use it as
                     # context if the interviewer continues speaking (continuation detection)
                     last_answered_question = q_text
@@ -453,7 +595,10 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
                     # --- QUESTION CLASSIFICATION & FOLLOW-UP DETECTION ---
                     q_type = await llm_client.classify_question(q_text)
-                    is_followup = is_followup_question(q_text, conversation_state["previous_question"])
+                    is_followup = (
+                        turn.get("intent") in {"followup", "continuation", "interruption"}
+                        or is_followup_question(q_text, conversation_state["previous_question"])
+                    )
 
                     if is_followup:
                         logger.info(f"Detected follow-up question to: '{conversation_state['previous_question'][:50]}...'")
@@ -467,6 +612,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # --- STREAMING GENERATION ---
                     answer_clean = ""
                     skipped = False
+                    interrupted = False
                     batch_buffer = ""
                     BATCH_CHARS = 8
 
@@ -479,6 +625,36 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         is_followup=is_followup,
                         conversation_summary=conversation_state["conversation_summary"]
                     ):
+                        # Zara-style AI interviewers can interrupt while the copilot is
+                        # still streaming. Drain any queued transcript immediately and
+                        # stop answering the stale question if the interviewer speaks.
+                        while True:
+                            try:
+                                tag_live, sentence_live = transcription_engine.text_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+
+                            session_logger.info(f"{tag_live}: {sentence_live}")
+                            message_live = f"{tag_live}: {sentence_live}"
+                            transcript_history.append(message_live)
+                            if len(transcript_history) > 30:
+                                transcript_history.pop(0)
+
+                            if tag_live == "[INTERVIEWER]":
+                                logger.info("Interruption detected while streaming. Stopping current answer.")
+                                interrupted = True
+                                interviewer_accumulator.clear()
+                                interviewer_accumulator.append(sentence_live)
+                                last_question = sentence_live
+                                last_advice = "<i style='color:#888888'>Listening to interviewer...</i>"
+                                interviewer_start_time = time.time()
+                                break
+                            elif tag_live == "[ME]":
+                                me_accumulator.append(sentence_live)
+
+                        if interrupted:
+                            break
+
                         if token == "__SKIP__":
                             skipped = True
                             break
@@ -498,10 +674,18 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # Hide typing indicator
                     ui_overlay.set_typing_indicator(False)
 
-                    if skipped:
+                    if interrupted:
+                        logger.info("Discarded partial answer because interviewer interrupted.")
+                        last_advice = "<i style='color:#888888'>Listening to interviewer...</i>"
+                        update_ui()
+                        continue
+                    elif skipped:
                         logger.info("LLM skipped conversational filler.")
                         last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
-                    elif answer_clean and not answer_clean.startswith("Error"):
+                    elif answer_clean.startswith("Error"):
+                        logger.error(f"LLM Error detected: {answer_clean}")
+                        last_advice = f"<span style='color:#ff6b6b'>âš  {answer_clean}</span>"
+                    elif answer_clean:
                         logger.info(f"LLM Advice generated.")
                         session_logger.info(f"[COPILOT ADVICE]:\n{answer_clean}\n" + "="*50)
                         last_advice = answer_clean
@@ -515,11 +699,11 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         conversation_state["previous_answer"] = answer_clean
                         update_conversation_summary(q_text, answer_clean, q_type)
                     else:
-                        logger.info(f"LLM skipped conversational filler.")
-                        last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
+                        logger.info(f"LLM returned empty response.")
+                        last_advice = "<i style='color:#888888'>(No answer generated)</i>"
 
                     # Final render with full markdown formatting
-                    ui_overlay.update_text(last_advice, question_type=q_type if q_type else "generic", is_streaming=False)
+                    update_ui()
 
 
                     
@@ -536,7 +720,7 @@ def main():
     run_dir = get_run_dir()
     load_dotenv(os.path.join(run_dir, ".env"))
     
-    # Register global hotkeys — requires keyboard library (may need admin on Windows)
+    # Register global hotkeys â€” requires keyboard library (may need admin on Windows)
     try:
         keyboard.add_hotkey('ctrl+shift+space', lambda: manual_trigger_event.set())
         logger.info("Hotkey registered: Ctrl+Shift+Space = Manual LLM Trigger")
@@ -564,15 +748,25 @@ def main():
     if not os.path.exists(portfolio_path):
         with open(portfolio_path, "w", encoding="utf-8") as f:
             f.write("# Enter your resume or portfolio skills here!\n")
+
+    interview_context_path = os.path.join(run_dir, "data", "interview_context.md")
+    if not os.path.exists(interview_context_path):
+        with open(interview_context_path, "w", encoding="utf-8") as f:
+            f.write(
+                "# Interview Context\n\n"
+                "Add target role, company, job description, preferred answer style, "
+                "technical focus areas, and interview-specific notes here. The copilot "
+                "will retrieve this alongside portfolio.md.\n"
+            )
             
     rag_manager = RAGManager(portfolio_path)
     rag_manager.ingest_portfolio()
     llm_client = LLMClient()
     
     # Initialize Queues & Core Engines
-    # maxsize caps prevent unbounded memory growth if LLM/processing is slow
-    audio_queue = asyncio.Queue(maxsize=200)
-    text_queue = asyncio.Queue(maxsize=100)
+    # maxsize increased to handle bursts and prevent QueueFull errors
+    audio_queue = asyncio.Queue(maxsize=1000)
+    text_queue = asyncio.Queue(maxsize=500)
     
     capture_engine = CaptureEngine()
     transcription_engine = TranscriptionEngine()

@@ -1,16 +1,22 @@
 import sys
 import os
 import re
+import ctypes
+import ctypes.wintypes
+import logging
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout,
-                              QLabel, QPushButton, QScrollArea, QSizeGrip,
+                              QLabel, QPushButton, QScrollArea, QSizeGrip, QTextEdit,
                               QSystemTrayIcon, QMenu)
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPoint, QRect
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QPoint, QRect, QEvent, QTimer
 from PyQt6.QtGui import QFont, QCursor, QFontDatabase, QPixmap, QPainter, QColor, QPolygon, QBrush, QPen, QIcon
+
+overlay_logger = logging.getLogger(__name__)
 
 class WorkerSignals(QObject):
     """Signals for communicating with the UI thread from async tasks."""
-    update_text = pyqtSignal(str)
+    update_text = pyqtSignal(str, str, int)
     set_typing_indicator = pyqtSignal(bool)
+    manual_question_submitted = pyqtSignal(str)
 
 class UIOverlay(QWidget):
     # Resize zone thickness in pixels
@@ -163,6 +169,7 @@ class UIOverlay(QWidget):
         """)
 
         self.scroll_area.setWidget(self.text_label)
+        self.scroll_area.setMinimumHeight(140)
         self.layout.addWidget(self.scroll_area)
 
         # Typing indicator label (hidden by default)
@@ -177,7 +184,50 @@ class UIOverlay(QWidget):
         self.typing_indicator.hide()
         self.layout.addWidget(self.typing_indicator)
 
-        # 5. Bottom-right resize grip for discoverability
+        # 5. Manual pasted-question input
+        self.chat_input = QTextEdit()
+        self.chat_input.setPlaceholderText("Paste an interview question...")
+        self.chat_input.setFixedHeight(64)
+        self.chat_input.installEventFilter(self)
+        self.chat_input.setStyleSheet(f"""
+            QTextEdit {{
+                color: #eeeeee;
+                background-color: rgba(35, 35, 35, 230);
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-family: 'Segoe UI', 'Arial', sans-serif;
+                font-size: 13px;
+                selection-background-color: #00a866;
+            }}
+            QTextEdit:focus {{
+                border: 1px solid #00fa9a;
+            }}
+        """)
+        self.layout.addWidget(self.chat_input)
+
+        chat_bar = QHBoxLayout()
+        chat_bar.addStretch()
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setFixedSize(70, 28)
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                color: #101010;
+                background-color: #00fa9a;
+                border-radius: 6px;
+                font-weight: bold;
+                font-family: 'Segoe UI';
+                border: none;
+            }
+            QPushButton:hover { background-color: #22ffad; }
+            QPushButton:pressed { background-color: #00c77a; }
+        """)
+        self.send_btn.clicked.connect(self._submit_manual_question)
+        chat_bar.addWidget(self.send_btn)
+        self.layout.addLayout(chat_bar)
+
+        # 6. Bottom-right resize grip for discoverability
         grip_bar = QHBoxLayout()
         grip_bar.addStretch()
         grip = QSizeGrip(self)
@@ -190,7 +240,37 @@ class UIOverlay(QWidget):
         self.signals.update_text.connect(self._set_text)
         self.signals.set_typing_indicator.connect(self._set_typing_indicator)
         self.show()
+        self._apply_capture_exclusion()
         self._setup_tray()
+
+    def _apply_capture_exclusion(self):
+        """
+        Makes this window invisible to ALL screen capture software:
+        - Screen sharing (micro1, Zoom, Teams, Google Meet)
+        - Screen recording (OBS, Windows Game Bar, ShareX)
+        - PrintScreen / Snipping Tool
+
+        Uses Windows API: SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        WDA_EXCLUDEFROMCAPTURE = 0x00000011
+
+        The window remains fully visible to the user on their physical monitor.
+        Only works on Windows 10 Build 2004+ and Windows 11.
+        """
+        try:
+            # Get the native Windows HWND from Qt
+            hwnd = int(self.winId())
+            WDA_EXCLUDEFROMCAPTURE = 0x00000011
+            result = ctypes.windll.user32.SetWindowDisplayAffinity(
+                ctypes.wintypes.HWND(hwnd),
+                ctypes.wintypes.DWORD(WDA_EXCLUDEFROMCAPTURE)
+            )
+            if result:
+                overlay_logger.info("[STEALTH] Window is now INVISIBLE to all screen capture and recording software.")
+            else:
+                error_code = ctypes.GetLastError()
+                overlay_logger.warning(f"[STEALTH] SetWindowDisplayAffinity failed (error={error_code}). Requires Windows 10 Build 2004+.")
+        except Exception as e:
+            overlay_logger.warning(f"[STEALTH] Could not apply capture exclusion: {e}")
 
     # --- Structured Answer Formatting ---
     def format_structured_answer(self, answer_text: str, question_text: str, question_type: str = "generic") -> str:
@@ -208,7 +288,8 @@ class UIOverlay(QWidget):
             return answer_text
 
         # Check if text is already HTML (starts with < and contains HTML tags)
-        is_already_html = answer_text.strip().startswith('<') and any(tag in answer_text for tag in ['<div', '<span', '<br', '<b>', '<i>', '<p>'])
+        # Using a more robust check for HTML tags
+        is_already_html = answer_text.strip().startswith('<') and any(tag in answer_text.lower() for tag in ['<div', '<span', '<br', '<b>', '<i', '<p', '<code'])
 
         if is_already_html:
             # Already HTML - don't escape, just return as-is
@@ -230,6 +311,9 @@ class UIOverlay(QWidget):
         else:
             # Generic formatting - just detect and format code blocks
             formatted_html = self._format_code_blocks(formatted_html)
+
+        formatted_html = self._format_inline_markdown(formatted_html)
+        formatted_html = self._format_bullet_lines(formatted_html)
 
         return formatted_html
 
@@ -274,6 +358,35 @@ class UIOverlay(QWidget):
 
         return html_text
 
+    def _format_inline_markdown(self, html_text: str) -> str:
+        """Apply lightweight markdown emphasis after HTML escaping."""
+        html_text = re.sub(r'\*\*(.+?)\*\*', r'<b style="color:#ffffff;">\1</b>', html_text)
+        html_text = re.sub(r'(?<!\*)\*([^*<][^*]*?)\*(?!\*)', r'<i>\1</i>', html_text)
+        return html_text
+
+    def _format_bullet_lines(self, html_text: str) -> str:
+        """Turn common markdown bullet lines into stable Qt HTML rows."""
+        lines = html_text.split("<br>")
+        formatted = []
+        bullet_prefixes = ("- ", "* ", "• ", "▸ ", "&#8226; ", "&#9656; ")
+
+        for line in lines:
+            stripped = line.strip()
+            matched_prefix = next((prefix for prefix in bullet_prefixes if stripped.startswith(prefix)), None)
+            if matched_prefix:
+                content = stripped[len(matched_prefix):].strip()
+                formatted.append(
+                    "<div style='margin:2px 0 2px 8px; color:#cccccc;'>"
+                    "<span style='color:#00fa9a; font-weight:bold;'>&rsaquo;</span>&nbsp;"
+                    f"{content}</div>"
+                )
+            elif not stripped:
+                formatted.append("<div style='height:4px;'></div>")
+            else:
+                formatted.append(f"{line}<br>")
+
+        return "".join(formatted)
+
     def _hex_to_rgb(self, hex_color: str) -> str:
         """Convert hex color to RGB string for rgba()."""
         hex_color = hex_color.lstrip('#')
@@ -315,20 +428,20 @@ class UIOverlay(QWidget):
     def render_code_block(self, code: str, language: str = "python") -> str:
         """
         Return HTML formatted code block with syntax highlighting styling.
-
-        Args:
-            code: The code content
-            language: Programming language for styling context
-
-        Returns:
-            HTML formatted code block
         """
-        # Clean up the code (unescape HTML entities that were escaped earlier)
         import html
+        # Step 1: Unescape HTML entities (e.g. &amp; &lt; &gt;)
         code = html.unescape(code)
+        # Step 2: Normalize <br> tags back to real newlines
+        # This is critical — the pipeline converts \n→<br> before code is extracted,
+        # so we must reverse that before passing to syntax highlighter.
+        code = code.replace("<br>", "\n").replace("<br/>", "\n").replace("<BR>", "\n")
 
-        # Apply basic syntax highlighting colors
+        # Step 3: Apply syntax highlighting (works on clean newline-separated code)
         highlighted = self._apply_syntax_highlighting(code, language)
+
+        # Step 4: Convert newlines back to <br> for Qt's HTML renderer
+        highlighted = highlighted.replace("\n", "<br>")
 
         html_block = f"""
         <div style="margin: 12px 0; background-color: #1e1e1e; border: 1px solid #333;
@@ -338,7 +451,7 @@ class UIOverlay(QWidget):
                 {language.upper()}
             </div>
             <div style="padding: 12px; background-color: #1e1e1e; font-family: '{self.CODE_FONT}', monospace;
-                        font-size: 13px; line-height: 1.5; color: #d4d4d4; white-space: pre-wrap; word-wrap: break-word;">
+                        font-size: 13px; line-height: 1.8; color: #d4d4d4;">
                 {highlighted}
             </div>
         </div>
@@ -452,10 +565,25 @@ class UIOverlay(QWidget):
         # Show a startup balloon notification
         self.tray.showMessage(
             "Interview Copilot",
-            "Running in background. Hotkeys: Ctrl+Shift+Space (trigger), Ctrl+R (regen).",
+            "Running in background. Hotkeys: Ctrl+Shift+Space (trigger), Ctrl+R (regen). Paste questions in the overlay.",
             QSystemTrayIcon.MessageIcon.Information,
             3000
         )
+
+    def eventFilter(self, obj, event):
+        if obj is self.chat_input and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    self._submit_manual_question()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _submit_manual_question(self):
+        question = self.chat_input.toPlainText().strip()
+        if not question:
+            return
+        self.chat_input.clear()
+        self.signals.manual_question_submitted.emit(question)
 
     def _toggle_visibility(self):
         if self.isVisible():
@@ -562,7 +690,7 @@ class UIOverlay(QWidget):
         else:
             self.typing_indicator.hide()
 
-    def update_text(self, text: str, question_type: str = "generic", is_streaming: bool = False):
+    def update_text(self, text: str, question_type: str = "generic", is_streaming: bool = False, scroll_mode: str = None):
         """
         Thread-safe command to update the text with optional formatting.
 
@@ -570,19 +698,34 @@ class UIOverlay(QWidget):
             text: The text content to display
             question_type: Type of question ("star", "technical", "code", "generic")
             is_streaming: If True, show ' Generating...' indicator
+            scroll_mode: "top", "preserve", or "bottom". Defaults to preserving during streaming
+                and showing the start of the answer for completed renders.
         """
-        formatted_text = self.format_structured_answer(text, question_type)
+        formatted_text = self.format_structured_answer(text, "", question_type)
 
         if is_streaming:
             formatted_text += '<div style="color: #00fa9a; font-style: italic; margin-top: 8px; font-size: 12px;"> Generating...</div>'
 
-        self.signals.update_text.emit(formatted_text)
+        if scroll_mode is None:
+            scroll_mode = "preserve" if is_streaming else "top"
 
-    def _set_text(self, text):
+        saved_scroll = self.scroll_area.verticalScrollBar().value()
+        self.signals.update_text.emit(formatted_text, scroll_mode, saved_scroll)
+
+    def _set_text(self, text, scroll_mode: str = "top", saved_scroll: int = 0):
         self.text_label.setText(text)
-        vsb = self.scroll_area.verticalScrollBar()
-        vsb.setValue(vsb.maximum())
+        self.text_label.adjustSize()
+        QTimer.singleShot(0, lambda: self._apply_scroll_mode(scroll_mode, saved_scroll))
         self.show()
+
+    def _apply_scroll_mode(self, scroll_mode: str, saved_scroll: int = 0):
+        vsb = self.scroll_area.verticalScrollBar()
+        if scroll_mode == "bottom":
+            vsb.setValue(vsb.maximum())
+        elif scroll_mode == "preserve":
+            vsb.setValue(min(saved_scroll, vsb.maximum()))
+        else:
+            vsb.setValue(0)
 
     def clear_text(self):
         self.text_label.setText("...")
