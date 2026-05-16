@@ -79,6 +79,21 @@ class TestModelRouter(unittest.TestCase):
 
         self.assertIn((backup_client, "groq_backup", "llama-3.1-8b-instant"), attempts)
 
+    def test_spoken_answer_style_is_enabled_by_default(self):
+        """Default prompt should be optimized for live spoken delivery."""
+        self.assertIn("SPOKEN LIVE INTERVIEW MODE", self.llm.system_prompt)
+        self.assertIn("Opening:", self.llm.system_prompt)
+        self.assertIn("Say:", self.llm.system_prompt)
+        self.assertIn("Close:", self.llm.system_prompt)
+
+    def test_standard_answer_style_can_disable_spoken_prompt(self):
+        """ANSWER_STYLE=standard keeps the old prompt shape available."""
+        with patch.dict("os.environ", {"ANSWER_STYLE": "standard"}, clear=False):
+            with patch("core.llm.AsyncGroq"):
+                llm = LLMClient()
+
+        self.assertNotIn("SPOKEN LIVE INTERVIEW MODE", llm.system_prompt)
+
 
 class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
     """Tests for generate_answer with fully mocked Groq API."""

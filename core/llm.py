@@ -72,6 +72,10 @@ class LLMClient:
         self.nvidia_tech_model = os.getenv("NVIDIA_TECHNICAL_MODEL", "meta/llama-3.3-70b-instruct")
         self.nvidia_behavior_model = os.getenv("NVIDIA_BEHAVIORAL_MODEL", "meta/llama-3.1-8b-instruct")
 
+        self.answer_style = os.getenv("ANSWER_STYLE", "spoken").strip().lower()
+        self.answer_max_bullets = os.getenv("ANSWER_MAX_BULLETS", "4").strip()
+        self.answer_include_close = os.getenv("ANSWER_INCLUDE_CLOSE", "true").strip().lower() not in {"0", "false", "no"}
+
         if self.provider == "nvidia":
             if not self.nvidia_key:
                 logger.warning("NVIDIA_API_KEY not found in environment! Falling back to Groq.")
@@ -265,6 +269,7 @@ For technical interviews, lead with the exact answer first, then add 2-4 precise
 - Maximum 400 tokens for technical, 250 for behavioral
 - If genuinely unsure about question intent, give a brief confident answer rather than asking for clarification
 """
+        self.system_prompt += self._answer_style_prompt()
 
 
 
@@ -294,6 +299,43 @@ For technical interviews, lead with the exact answer first, then add 2-4 precise
         'observability', 'monitoring', 'logging', 'alerting', 'incident',
         'kubernetes', 'pod', 'deployment', 'service', 'ingress', 'helm',
     }
+
+    def _answer_style_prompt(self) -> str:
+        """Optional answer-shaping instructions for live spoken interviews."""
+        if self.answer_style not in {"spoken", "natural", "live"}:
+            return ""
+
+        close_instruction = "Include a Close line." if self.answer_include_close else "Skip the Close line unless it is necessary."
+        return f"""
+
+---
+
+## SPOKEN LIVE INTERVIEW MODE
+Format most answers for natural speech, not reading. The candidate should be able to start talking after reading only the first line.
+
+Use this structure unless the question explicitly asks for code:
+
+Opening:
+One short, natural sentence I can say immediately while I organize the answer.
+
+Say:
+â–¸ {self.answer_max_bullets} or fewer short speakable bullets
+â–¸ Each bullet must be one sentence max
+â–¸ Use practical wording, not textbook wording
+â–¸ Prefer "I'd start by...", "I usually check...", "The tradeoff is..."
+
+Close:
+One optional sentence that sounds like a confident wrap-up or trade-off.
+
+Rules:
+- Do not produce long paragraphs.
+- Do not sound like a written article.
+- Do not include every possible detail; leave room for follow-up questions.
+- For troubleshooting, the first Say bullet should be the exact first command/check.
+- For architecture, cover only the highest-value components and one trade-off.
+- For behavioral questions, keep STAR but make each section one short spoken sentence.
+- {close_instruction}
+"""
 
     def _has_technical_keyword(self, text_lower: str) -> bool:
         """Match technical routing terms without short-token false positives."""
