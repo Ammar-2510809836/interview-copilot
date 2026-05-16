@@ -6,9 +6,11 @@ from groq import AsyncGroq
 from openai import AsyncOpenAI
 
 try:
-    from cerebras.cloud.sdk import Cerebras
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:
-    Cerebras = None
+    genai = None
+    genai_types = None
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +59,14 @@ Current accumulated interviewer text:
 class LLMClient:
     """
     Anti-hallucination LLM brain strictly generating 30-word bullet points.
-    Supports multiple providers: Groq, NVIDIA NIM, and Cerebras.
+    Supports multiple providers: Groq, NVIDIA NIM, and Gemini.
     """
     def __init__(self):
         self.provider = os.getenv("LLM_PROVIDER", "groq").lower()
         self.groq_key = os.getenv("GROQ_API_KEY")
         self.groq_backup_key = os.getenv("GROQ_BACKUP_API_KEY")
         self.nvidia_key = os.getenv("NVIDIA_API_KEY")
-        self.cerebras_key = os.getenv("CEREBRAS_API_KEY")
+        self.gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         self.client = None
         self.fallback_client = None
         self.groq_backup_client = None
@@ -78,11 +80,8 @@ class LLMClient:
         self.nvidia_tech_model = os.getenv("NVIDIA_TECHNICAL_MODEL", "meta/llama-3.3-70b-instruct")
         self.nvidia_behavior_model = os.getenv("NVIDIA_BEHAVIORAL_MODEL", "meta/llama-3.1-8b-instruct")
 
-        self.cerebras_tech_model = os.getenv("CEREBRAS_TECHNICAL_MODEL", "gpt-oss-120b")
-        self.cerebras_behavior_model = os.getenv("CEREBRAS_BEHAVIORAL_MODEL", "zai-glm-4.7")
-        self.cerebras_reasoning_effort = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
-        self.cerebras_timeout = float(os.getenv("CEREBRAS_TIMEOUT", "12"))
-        self.cerebras_max_retries = int(os.getenv("CEREBRAS_MAX_RETRIES", "0"))
+        self.gemini_tech_model = os.getenv("GEMINI_TECHNICAL_MODEL", "gemini-2.5-flash")
+        self.gemini_behavior_model = os.getenv("GEMINI_BEHAVIORAL_MODEL", "gemini-2.5-flash-lite")
 
         self.answer_style = os.getenv("ANSWER_STYLE", "spoken").strip().lower()
         self.answer_max_bullets = os.getenv("ANSWER_MAX_BULLETS", "4").strip()
@@ -99,20 +98,16 @@ class LLMClient:
                     api_key=self.nvidia_key
                 )
 
-        if self.provider == "cerebras":
-            if not self.cerebras_key:
-                logger.warning("CEREBRAS_API_KEY not found in environment! Falling back to Groq.")
+        if self.provider == "gemini":
+            if not self.gemini_key:
+                logger.warning("GEMINI_API_KEY not found in environment! Falling back to Groq.")
                 self.provider = "groq"
-            elif Cerebras is None:
-                logger.warning("cerebras_cloud_sdk not installed! Falling back to Groq.")
+            elif genai is None:
+                logger.warning("google-genai not installed! Falling back to Groq.")
                 self.provider = "groq"
             else:
-                logger.info(f"LLM Provider: Cerebras (Tech: {self.cerebras_tech_model})")
-                self.client = Cerebras(
-                    api_key=self.cerebras_key,
-                    timeout=self.cerebras_timeout,
-                    max_retries=self.cerebras_max_retries,
-                )
+                logger.info(f"LLM Provider: Gemini (Tech: {self.gemini_tech_model})")
+                self.client = genai.Client(api_key=self.gemini_key)
 
         if self.provider == "groq":
             if not self.groq_key:
@@ -120,7 +115,7 @@ class LLMClient:
             logger.info(f"LLM Provider: Groq (Tech: {self.groq_tech_model})")
             self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
 
-        if self.provider not in {"groq", "nvidia", "cerebras"}:
+        if self.provider not in {"groq", "nvidia", "gemini"}:
             logger.warning("Unsupported LLM_PROVIDER=%s; falling back to Groq.", self.provider)
             self.provider = "groq"
             self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
@@ -408,23 +403,23 @@ Rules:
                 return self.nvidia_tech_model, 500
             else:
                 return self.nvidia_behavior_model, 300
-        elif self.provider == "cerebras":
+        elif self.provider == "gemini":
             if question_type:
                 if question_type in ["coding", "technical"]:
-                    return self.cerebras_tech_model, 500
+                    return self.gemini_tech_model, 500
                 elif question_type in ["behavioral", "followup"]:
-                    return self.cerebras_behavior_model, 300
+                    return self.gemini_behavior_model, 300
                 else:
-                    return self.cerebras_behavior_model, 250
+                    return self.gemini_behavior_model, 250
 
             text_lower = question_text.lower()
             is_technical = self._has_technical_keyword(text_lower)
             if is_technical:
-                logger.info(f"Router: Technical question → {self.cerebras_tech_model}")
-                return self.cerebras_tech_model, 500
+                logger.info(f"Router: Technical question → {self.gemini_tech_model}")
+                return self.gemini_tech_model, 500
             else:
-                logger.info(f"Router: Behavioral/HR question → {self.cerebras_behavior_model}")
-                return self.cerebras_behavior_model, 250
+                logger.info(f"Router: Behavioral/HR question → {self.gemini_behavior_model}")
+                return self.gemini_behavior_model, 250
         else:
             # Groq model mapping
             if question_type:
@@ -508,11 +503,11 @@ Rules:
                 models.append(model)
         return models
 
-    def _cerebras_fallback_models(self, primary_model: str) -> list[str]:
-        """Return same-provider Cerebras fallback models."""
-        configured = os.getenv("CEREBRAS_FALLBACK_MODELS", "")
+    def _gemini_fallback_models(self, primary_model: str) -> list[str]:
+        """Return same-provider Gemini fallback models."""
+        configured = os.getenv("GEMINI_FALLBACK_MODELS", "")
         fallback_models = [m.strip() for m in configured.split(",") if m.strip()]
-        fallback_models.append(self.cerebras_behavior_model)
+        fallback_models.append(self.gemini_behavior_model)
 
         models = []
         for model in fallback_models:
@@ -527,9 +522,9 @@ Rules:
         """
         attempts = [(self.client, self.provider, primary_model)]
 
-        if self.provider == "cerebras" and self.client:
-            for model in self._cerebras_fallback_models(primary_model):
-                attempts.append((self.client, "cerebras", model))
+        if self.provider == "gemini" and self.client:
+            for model in self._gemini_fallback_models(primary_model):
+                attempts.append((self.client, "gemini", model))
 
         groq_client = self.client if self.provider == "groq" else self.fallback_client
         if groq_client:
@@ -553,17 +548,27 @@ Rules:
                 logger.warning("Invalid GROQ_FALLBACK_MAX_TOKENS=%s; using default.", configured)
         return min(max_tokens, 350)
 
-    def _cerebras_params(self, max_tokens: int, temperature: float, stream: bool = False) -> dict:
-        """Translate common chat params to Cerebras SDK params."""
-        params = {
-            "max_completion_tokens": max_tokens,
+    def _gemini_request(self, messages: list, max_tokens: int, temperature: float) -> tuple[str, object]:
+        """Translate chat-style messages into Gemini contents and config."""
+        system_parts = []
+        content_parts = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "system":
+                system_parts.append(content)
+            else:
+                content_parts.append(f"{role.upper()}:\n{content}")
+
+        config_kwargs = {
             "temperature": temperature,
-            "top_p": 1,
-            "stream": stream,
+            "max_output_tokens": max_tokens,
         }
-        if self.cerebras_reasoning_effort:
-            params["reasoning_effort"] = self.cerebras_reasoning_effort
-        return params
+        if system_parts:
+            config_kwargs["system_instruction"] = "\n\n".join(system_parts)
+
+        config = genai_types.GenerateContentConfig(**config_kwargs) if genai_types else config_kwargs
+        return "\n\n".join(content_parts), config
 
     async def _chat_completion_create(
         self,
@@ -576,11 +581,18 @@ Rules:
         stream: bool = False,
     ):
         """Create a chat completion across supported provider SDKs."""
-        if provider == "cerebras":
-            return client.chat.completions.create(
+        if provider == "gemini":
+            contents, config = self._gemini_request(messages, max_tokens, temperature)
+            if stream:
+                return client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            return client.models.generate_content(
                 model=model,
-                messages=messages,
-                **self._cerebras_params(max_tokens, temperature, stream=stream),
+                contents=contents,
+                config=config,
             )
 
         return await client.chat.completions.create(
@@ -603,6 +615,12 @@ Rules:
 
     def _response_text(self, response) -> str:
         """Extract assistant text defensively across provider response shapes."""
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text:
+            return str(text).strip()
+        if text is None:
+            return ""
+
         try:
             message = response.choices[0].message
         except (AttributeError, IndexError, TypeError):
@@ -615,6 +633,12 @@ Rules:
 
     def _chunk_text(self, chunk) -> str:
         """Extract stream delta text defensively across provider chunk shapes."""
+        text = getattr(chunk, "text", None)
+        if isinstance(text, str) and text:
+            return str(text)
+        if text is None:
+            return ""
+
         try:
             delta = chunk.choices[0].delta
         except (AttributeError, IndexError, TypeError):
@@ -635,8 +659,8 @@ Rules:
 
         if self.provider == "nvidia":
             classification_model = self.nvidia_behavior_model
-        elif self.provider == "cerebras":
-            classification_model = self.cerebras_behavior_model
+        elif self.provider == "gemini":
+            classification_model = self.gemini_behavior_model
         else:
             classification_model = self.groq_behavior_model
 
@@ -739,8 +763,8 @@ Rules:
 
         if self.provider == "nvidia":
             model = self.nvidia_behavior_model
-        elif self.provider == "cerebras":
-            model = self.cerebras_behavior_model
+        elif self.provider == "gemini":
+            model = self.gemini_behavior_model
         else:
             model = self.groq_behavior_model
         history = "\n".join((transcript_history or [])[-8:])
@@ -1086,8 +1110,8 @@ Output: YES'''
 
         if self.provider == "nvidia":
             gating_model = self.nvidia_behavior_model
-        elif self.provider == "cerebras":
-            gating_model = self.cerebras_behavior_model
+        elif self.provider == "gemini":
+            gating_model = self.gemini_behavior_model
         else:
             gating_model = self.groq_behavior_model
 

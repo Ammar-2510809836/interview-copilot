@@ -79,79 +79,67 @@ class TestModelRouter(unittest.TestCase):
 
         self.assertIn((backup_client, "groq_backup", "llama-3.1-8b-instant"), attempts)
 
-    def test_cerebras_provider_routes_to_cerebras_models(self):
-        """Cerebras can be selected as a primary provider."""
+    def test_gemini_provider_routes_to_current_flash_models(self):
+        """Gemini can be selected as a primary provider with current model ids."""
         with patch.dict(
             "os.environ",
             {
-                "LLM_PROVIDER": "cerebras",
-                "CEREBRAS_API_KEY": "test-key",
-                "CEREBRAS_TECHNICAL_MODEL": "gpt-oss-120b",
-                "CEREBRAS_BEHAVIORAL_MODEL": "zai-glm-4.7",
+                "LLM_PROVIDER": "gemini",
+                "GEMINI_API_KEY": "test-key",
+                "GEMINI_TECHNICAL_MODEL": "gemini-2.5-flash",
+                "GEMINI_BEHAVIORAL_MODEL": "gemini-2.5-flash-lite",
             },
             clear=False,
         ):
-            with patch("core.llm.Cerebras") as mock_cerebras, patch("core.llm.AsyncGroq"):
-                mock_cerebras.return_value = MagicMock()
+            with patch("core.llm.genai") as mock_genai, patch("core.llm.AsyncGroq"):
+                mock_genai.Client.return_value = MagicMock()
                 llm = LLMClient()
 
         tech_model, tech_tokens = llm._route_model("explain aws vpc networking", "technical")
         behavior_model, behavior_tokens = llm._route_model("tell me about yourself", "behavioral")
 
-        self.assertEqual(tech_model, "gpt-oss-120b")
+        self.assertEqual(tech_model, "gemini-2.5-flash")
         self.assertGreaterEqual(tech_tokens, 400)
-        self.assertEqual(behavior_model, "zai-glm-4.7")
+        self.assertEqual(behavior_model, "gemini-2.5-flash-lite")
         self.assertLessEqual(behavior_tokens, 300)
 
-    def test_cerebras_client_disables_sdk_retries_by_default(self):
-        """Cerebras 429s should reach our fallback logic immediately."""
-        with patch.dict(
-            "os.environ",
-            {"LLM_PROVIDER": "cerebras", "CEREBRAS_API_KEY": "test-key"},
-            clear=False,
-        ):
-            with patch("core.llm.Cerebras") as mock_cerebras, patch("core.llm.AsyncGroq"):
-                mock_cerebras.return_value = MagicMock()
-                LLMClient()
-
-        kwargs = mock_cerebras.call_args.kwargs
-        self.assertEqual(kwargs["max_retries"], 0)
-        self.assertEqual(kwargs["timeout"], 12.0)
-
-    def test_cerebras_primary_adds_same_provider_fallback(self):
-        """Cerebras primary attempts should try zai-glm-4.7 before external fallback."""
-        self.llm.provider = "cerebras"
+    def test_gemini_primary_adds_same_provider_fallback(self):
+        """Gemini primary attempts should try Flash-Lite before external fallback."""
+        self.llm.provider = "gemini"
         self.llm.client = MagicMock()
-        self.llm.cerebras_tech_model = "gpt-oss-120b"
-        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+        self.llm.gemini_tech_model = "gemini-2.5-flash"
+        self.llm.gemini_behavior_model = "gemini-2.5-flash-lite"
 
-        attempts = self.llm._model_attempts("gpt-oss-120b")
+        attempts = self.llm._model_attempts("gemini-2.5-flash")
 
-        self.assertEqual(attempts[0][1:], ("cerebras", "gpt-oss-120b"))
-        self.assertIn((self.llm.client, "cerebras", "zai-glm-4.7"), attempts)
+        self.assertEqual(attempts[0][1:], ("gemini", "gemini-2.5-flash"))
+        self.assertIn((self.llm.client, "gemini", "gemini-2.5-flash-lite"), attempts)
 
-    def test_cerebras_create_uses_max_completion_tokens(self):
-        """Cerebras SDK uses max_completion_tokens instead of max_tokens."""
+    def test_gemini_create_uses_generate_content_config(self):
+        """Gemini SDK uses generate_content with contents and config."""
         client = MagicMock()
         response = MagicMock()
-        client.chat.completions.create.return_value = response
+        response.text = "ok"
+        client.models.generate_content.return_value = response
 
         result = asyncio.run(self.llm._chat_completion_create(
             client,
-            "cerebras",
-            "gpt-oss-120b",
-            messages=[{"role": "user", "content": "hi"}],
+            "gemini",
+            "gemini-2.5-flash",
+            messages=[
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "hi"},
+            ],
             max_tokens=123,
             temperature=0.2,
-            stream=True,
+            stream=False,
         ))
 
         self.assertIs(result, response)
-        kwargs = client.chat.completions.create.call_args.kwargs
-        self.assertEqual(kwargs["model"], "gpt-oss-120b")
-        self.assertEqual(kwargs["max_completion_tokens"], 123)
-        self.assertTrue(kwargs["stream"])
-        self.assertEqual(kwargs["reasoning_effort"], "medium")
+        kwargs = client.models.generate_content.call_args.kwargs
+        self.assertEqual(kwargs["model"], "gemini-2.5-flash")
+        self.assertIn("USER:\nhi", kwargs["contents"])
+        self.assertIn("config", kwargs)
 
     def test_spoken_answer_style_is_enabled_by_default(self):
         """Default prompt should be optimized for live spoken delivery."""
@@ -263,22 +251,20 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
             "llama-3.1-8b-instant"
         )
 
-    async def test_generate_answer_cerebras_failure_uses_cerebras_fallback_model(self):
-        """Cerebras primary should retry zai-glm-4.7 before Groq fallback."""
+    async def test_generate_answer_gemini_failure_uses_gemini_fallback_model(self):
+        """Gemini primary should retry Flash-Lite before Groq fallback."""
         client = MagicMock()
-        fallback_choice = MagicMock()
-        fallback_choice.message.content = "Cerebras fallback answer."
         fallback_response = MagicMock()
-        fallback_response.choices = [fallback_choice]
-        client.chat.completions.create.side_effect = [
+        fallback_response.text = "Gemini fallback answer."
+        client.models.generate_content.side_effect = [
             Exception("429 Too Many Requests"),
             fallback_response,
         ]
 
-        self.llm.provider = "cerebras"
+        self.llm.provider = "gemini"
         self.llm.client = client
-        self.llm.cerebras_tech_model = "gpt-oss-120b"
-        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+        self.llm.gemini_tech_model = "gemini-2.5-flash"
+        self.llm.gemini_behavior_model = "gemini-2.5-flash-lite"
 
         result = await self.llm.generate_answer(
             ["[INTERVIEWER]: Explain AWS VPC design."],
@@ -286,30 +272,25 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
             question_type="technical"
         )
 
-        self.assertEqual(result, "Cerebras fallback answer.")
-        calls = client.chat.completions.create.call_args_list
-        self.assertEqual(calls[0].kwargs["model"], "gpt-oss-120b")
-        self.assertEqual(calls[1].kwargs["model"], "zai-glm-4.7")
+        self.assertEqual(result, "Gemini fallback answer.")
+        calls = client.models.generate_content.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "gemini-2.5-flash")
+        self.assertEqual(calls[1].kwargs["model"], "gemini-2.5-flash-lite")
 
     async def test_generate_answer_empty_content_uses_fallback_model(self):
         """Provider responses with content=None should not leave the overlay blank."""
         client = MagicMock()
-        empty_choice = MagicMock()
-        empty_choice.message.content = None
         empty_response = MagicMock()
-        empty_response.choices = [empty_choice]
-
-        fallback_choice = MagicMock()
-        fallback_choice.message.content = "Fallback after empty."
+        empty_response.text = None
         fallback_response = MagicMock()
-        fallback_response.choices = [fallback_choice]
+        fallback_response.text = "Fallback after empty."
 
-        client.chat.completions.create.side_effect = [empty_response, fallback_response]
+        client.models.generate_content.side_effect = [empty_response, fallback_response]
 
-        self.llm.provider = "cerebras"
+        self.llm.provider = "gemini"
         self.llm.client = client
-        self.llm.cerebras_tech_model = "gpt-oss-120b"
-        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+        self.llm.gemini_tech_model = "gemini-2.5-flash"
+        self.llm.gemini_behavior_model = "gemini-2.5-flash-lite"
 
         result = await self.llm.generate_answer(
             ["[INTERVIEWER]: Please introduce yourself briefly."],
@@ -527,18 +508,20 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
             "llama-3.3-70b-versatile"
         )
 
-    async def test_stream_empty_cerebras_response_uses_cerebras_fallback_model(self):
-        """Empty Cerebras streams should retry the same-provider fallback model."""
-        empty_chunk = self._make_stream_chunks([None])
-        fallback_chunks = self._make_stream_chunks(["Recovered"])
+    async def test_stream_empty_gemini_response_uses_gemini_fallback_model(self):
+        """Empty Gemini streams should retry the same-provider fallback model."""
+        empty_chunk = MagicMock()
+        empty_chunk.text = None
+        fallback_chunk = MagicMock()
+        fallback_chunk.text = "Recovered"
 
         client = MagicMock()
-        client.chat.completions.create.side_effect = [empty_chunk, fallback_chunks]
+        client.models.generate_content_stream.side_effect = [[empty_chunk], [fallback_chunk]]
 
-        self.llm.provider = "cerebras"
+        self.llm.provider = "gemini"
         self.llm.client = client
-        self.llm.cerebras_tech_model = "gpt-oss-120b"
-        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+        self.llm.gemini_tech_model = "gemini-2.5-flash"
+        self.llm.gemini_behavior_model = "gemini-2.5-flash-lite"
 
         result = ""
         async for token in self.llm.generate_answer_stream(
@@ -549,9 +532,9 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
             result += token
 
         self.assertEqual(result, "Recovered")
-        calls = client.chat.completions.create.call_args_list
-        self.assertEqual(calls[0].kwargs["model"], "gpt-oss-120b")
-        self.assertEqual(calls[1].kwargs["model"], "zai-glm-4.7")
+        calls = client.models.generate_content_stream.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "gemini-2.5-flash")
+        self.assertEqual(calls[1].kwargs["model"], "gemini-2.5-flash-lite")
 
 
 if __name__ == "__main__":
