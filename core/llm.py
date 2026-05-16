@@ -81,6 +81,8 @@ class LLMClient:
         self.cerebras_tech_model = os.getenv("CEREBRAS_TECHNICAL_MODEL", "gpt-oss-120b")
         self.cerebras_behavior_model = os.getenv("CEREBRAS_BEHAVIORAL_MODEL", "zai-glm-4.7")
         self.cerebras_reasoning_effort = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
+        self.cerebras_timeout = float(os.getenv("CEREBRAS_TIMEOUT", "12"))
+        self.cerebras_max_retries = int(os.getenv("CEREBRAS_MAX_RETRIES", "0"))
 
         self.answer_style = os.getenv("ANSWER_STYLE", "spoken").strip().lower()
         self.answer_max_bullets = os.getenv("ANSWER_MAX_BULLETS", "4").strip()
@@ -106,7 +108,11 @@ class LLMClient:
                 self.provider = "groq"
             else:
                 logger.info(f"LLM Provider: Cerebras (Tech: {self.cerebras_tech_model})")
-                self.client = Cerebras(api_key=self.cerebras_key)
+                self.client = Cerebras(
+                    api_key=self.cerebras_key,
+                    timeout=self.cerebras_timeout,
+                    max_retries=self.cerebras_max_retries,
+                )
 
         if self.provider == "groq":
             if not self.groq_key:
@@ -470,6 +476,7 @@ Rules:
                 "503",
                 "502",
                 "500",
+                "empty content",
             )
         )
 
@@ -594,6 +601,30 @@ Rules:
         for chunk in stream:
             yield chunk
 
+    def _response_text(self, response) -> str:
+        """Extract assistant text defensively across provider response shapes."""
+        try:
+            message = response.choices[0].message
+        except (AttributeError, IndexError, TypeError):
+            return ""
+
+        content = getattr(message, "content", None)
+        if content is None:
+            return ""
+        return str(content).strip()
+
+    def _chunk_text(self, chunk) -> str:
+        """Extract stream delta text defensively across provider chunk shapes."""
+        try:
+            delta = chunk.choices[0].delta
+        except (AttributeError, IndexError, TypeError):
+            return ""
+
+        content = getattr(delta, "content", None)
+        if content is None:
+            return ""
+        return str(content)
+
     async def classify_question(self, question_text: str) -> str:
         """
         Classify interview question into type: behavioral, technical, coding, followup, or filler.
@@ -621,7 +652,10 @@ Rules:
                 max_tokens=10,
                 temperature=0.0,
             )
-            result = response.choices[0].message.content.strip().lower()
+            result = self._response_text(response).lower()
+            if not result:
+                logger.warning("Question classification returned empty content.")
+                return "behavioral"
 
             valid_types = {"behavioral", "technical", "coding", "followup", "filler"}
             for vtype in valid_types:
@@ -727,7 +761,10 @@ Rules:
                 max_tokens=120,
                 temperature=0.0,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = self._response_text(response)
+            if not raw:
+                logger.warning("Turn classification returned empty content.")
+                return fallback
             match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
             data = json.loads(match.group(0) if match else raw)
 
@@ -800,7 +837,9 @@ Rules:
                     temperature=0.2,
                 )
 
-                output = response.choices[0].message.content.strip()
+                output = self._response_text(response)
+                if not output:
+                    raise ValueError("LLM returned empty content")
                 return output
 
             except Exception as e:
@@ -864,7 +903,7 @@ Rules:
             async for chunk in stream:
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta.content
+                delta = self._chunk_text(chunk)
                 if delta:
                     accumulated += delta
                     # Early SKIP detection — if first tokens spell SKIP, abort
@@ -932,13 +971,15 @@ Rules:
                 async for chunk in self._stream_chunks(stream):
                     if not chunk.choices:
                         continue
-                    delta = chunk.choices[0].delta.content
+                    delta = self._chunk_text(chunk)
                     if delta:
                         accumulated += delta
                         if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
                             yield "__SKIP__"
                             return
                         yield delta
+                if not accumulated.strip():
+                    raise ValueError("LLM stream returned empty content")
                 return
 
             except Exception as e:
@@ -991,7 +1032,10 @@ Rules:
                     max_tokens=attempt_max_tokens,
                     temperature=0.6,  # Higher temperature = different answer each regen
                 )
-                return response.choices[0].message.content.strip()
+                output = self._response_text(response)
+                if not output:
+                    raise ValueError("LLM returned empty content")
+                return output
             except Exception as e:
                 if self._is_retryable_llm_error(e) and index < len(attempts) - 1:
                     logger.warning("LLM regen %s model %s failed; trying fallback. Error: %s", attempt_provider, attempt_model, e)
@@ -1060,7 +1104,7 @@ Output: YES'''
                 temperature=0.0, # Deterministic
             )
             
-            output = response.choices[0].message.content.strip().upper()
+            output = self._response_text(response).upper()
             return "YES" in output
             
         except Exception as e:

@@ -103,6 +103,21 @@ class TestModelRouter(unittest.TestCase):
         self.assertEqual(behavior_model, "zai-glm-4.7")
         self.assertLessEqual(behavior_tokens, 300)
 
+    def test_cerebras_client_disables_sdk_retries_by_default(self):
+        """Cerebras 429s should reach our fallback logic immediately."""
+        with patch.dict(
+            "os.environ",
+            {"LLM_PROVIDER": "cerebras", "CEREBRAS_API_KEY": "test-key"},
+            clear=False,
+        ):
+            with patch("core.llm.Cerebras") as mock_cerebras, patch("core.llm.AsyncGroq"):
+                mock_cerebras.return_value = MagicMock()
+                LLMClient()
+
+        kwargs = mock_cerebras.call_args.kwargs
+        self.assertEqual(kwargs["max_retries"], 0)
+        self.assertEqual(kwargs["timeout"], 12.0)
+
     def test_cerebras_primary_adds_same_provider_fallback(self):
         """Cerebras primary attempts should try zai-glm-4.7 before external fallback."""
         self.llm.provider = "cerebras"
@@ -275,6 +290,34 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
         calls = client.chat.completions.create.call_args_list
         self.assertEqual(calls[0].kwargs["model"], "gpt-oss-120b")
         self.assertEqual(calls[1].kwargs["model"], "zai-glm-4.7")
+
+    async def test_generate_answer_empty_content_uses_fallback_model(self):
+        """Provider responses with content=None should not leave the overlay blank."""
+        client = MagicMock()
+        empty_choice = MagicMock()
+        empty_choice.message.content = None
+        empty_response = MagicMock()
+        empty_response.choices = [empty_choice]
+
+        fallback_choice = MagicMock()
+        fallback_choice.message.content = "Fallback after empty."
+        fallback_response = MagicMock()
+        fallback_response.choices = [fallback_choice]
+
+        client.chat.completions.create.side_effect = [empty_response, fallback_response]
+
+        self.llm.provider = "cerebras"
+        self.llm.client = client
+        self.llm.cerebras_tech_model = "gpt-oss-120b"
+        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+
+        result = await self.llm.generate_answer(
+            ["[INTERVIEWER]: Please introduce yourself briefly."],
+            "context",
+            question_type="technical"
+        )
+
+        self.assertEqual(result, "Fallback after empty.")
 
     async def test_generate_answer_regen_higher_temperature(self):
         """generate_answer_regen should call the API with temperature >= 0.5."""
@@ -483,6 +526,32 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
             backup_client.chat.completions.create.call_args.kwargs["model"],
             "llama-3.3-70b-versatile"
         )
+
+    async def test_stream_empty_cerebras_response_uses_cerebras_fallback_model(self):
+        """Empty Cerebras streams should retry the same-provider fallback model."""
+        empty_chunk = self._make_stream_chunks([None])
+        fallback_chunks = self._make_stream_chunks(["Recovered"])
+
+        client = MagicMock()
+        client.chat.completions.create.side_effect = [empty_chunk, fallback_chunks]
+
+        self.llm.provider = "cerebras"
+        self.llm.client = client
+        self.llm.cerebras_tech_model = "gpt-oss-120b"
+        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+
+        result = ""
+        async for token in self.llm.generate_answer_stream(
+            ["[INTERVIEWER]: Explain AWS VPC design."],
+            "context",
+            question_type="technical"
+        ):
+            result += token
+
+        self.assertEqual(result, "Recovered")
+        calls = client.chat.completions.create.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "gpt-oss-120b")
+        self.assertEqual(calls[1].kwargs["model"], "zai-glm-4.7")
 
 
 if __name__ == "__main__":
