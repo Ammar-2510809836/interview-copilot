@@ -79,12 +79,82 @@ class TestModelRouter(unittest.TestCase):
 
         self.assertIn((backup_client, "groq_backup", "llama-3.1-8b-instant"), attempts)
 
+    def test_cerebras_provider_routes_to_cerebras_models(self):
+        """Cerebras can be selected as a primary provider."""
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_PROVIDER": "cerebras",
+                "CEREBRAS_API_KEY": "test-key",
+                "CEREBRAS_TECHNICAL_MODEL": "gpt-oss-120b",
+                "CEREBRAS_BEHAVIORAL_MODEL": "zai-glm-4.7",
+            },
+            clear=False,
+        ):
+            with patch("core.llm.Cerebras") as mock_cerebras, patch("core.llm.AsyncGroq"):
+                mock_cerebras.return_value = MagicMock()
+                llm = LLMClient()
+
+        tech_model, tech_tokens = llm._route_model("explain aws vpc networking", "technical")
+        behavior_model, behavior_tokens = llm._route_model("tell me about yourself", "behavioral")
+
+        self.assertEqual(tech_model, "gpt-oss-120b")
+        self.assertGreaterEqual(tech_tokens, 400)
+        self.assertEqual(behavior_model, "zai-glm-4.7")
+        self.assertLessEqual(behavior_tokens, 300)
+
+    def test_cerebras_primary_adds_same_provider_fallback(self):
+        """Cerebras primary attempts should try zai-glm-4.7 before external fallback."""
+        self.llm.provider = "cerebras"
+        self.llm.client = MagicMock()
+        self.llm.cerebras_tech_model = "gpt-oss-120b"
+        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+
+        attempts = self.llm._model_attempts("gpt-oss-120b")
+
+        self.assertEqual(attempts[0][1:], ("cerebras", "gpt-oss-120b"))
+        self.assertIn((self.llm.client, "cerebras", "zai-glm-4.7"), attempts)
+
+    def test_cerebras_create_uses_max_completion_tokens(self):
+        """Cerebras SDK uses max_completion_tokens instead of max_tokens."""
+        client = MagicMock()
+        response = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        result = asyncio.run(self.llm._chat_completion_create(
+            client,
+            "cerebras",
+            "gpt-oss-120b",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=123,
+            temperature=0.2,
+            stream=True,
+        ))
+
+        self.assertIs(result, response)
+        kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "gpt-oss-120b")
+        self.assertEqual(kwargs["max_completion_tokens"], 123)
+        self.assertTrue(kwargs["stream"])
+        self.assertEqual(kwargs["reasoning_effort"], "medium")
+
     def test_spoken_answer_style_is_enabled_by_default(self):
         """Default prompt should be optimized for live spoken delivery."""
         self.assertIn("SPOKEN LIVE INTERVIEW MODE", self.llm.system_prompt)
         self.assertIn("Opening:", self.llm.system_prompt)
         self.assertIn("Say:", self.llm.system_prompt)
         self.assertIn("Close:", self.llm.system_prompt)
+
+    def test_system_prompt_keeps_role_adaptation_generic(self):
+        """Base prompt should not hardcode one job family or vendor."""
+        lower_prompt = self.llm.system_prompt.lower()
+
+        self.assertIn("match the target role", lower_prompt)
+        self.assertNotIn("zendesk", lower_prompt)
+        self.assertNotIn("intercom", lower_prompt)
+        self.assertNotIn("gorgias", lower_prompt)
+        self.assertNotIn("servicenow", lower_prompt)
+        self.assertNotIn("customer success/support", lower_prompt)
 
     def test_standard_answer_style_can_disable_spoken_prompt(self):
         """ANSWER_STYLE=standard keeps the old prompt shape available."""
@@ -177,6 +247,34 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
             fallback_client.chat.completions.create.call_args.kwargs["model"],
             "llama-3.1-8b-instant"
         )
+
+    async def test_generate_answer_cerebras_failure_uses_cerebras_fallback_model(self):
+        """Cerebras primary should retry zai-glm-4.7 before Groq fallback."""
+        client = MagicMock()
+        fallback_choice = MagicMock()
+        fallback_choice.message.content = "Cerebras fallback answer."
+        fallback_response = MagicMock()
+        fallback_response.choices = [fallback_choice]
+        client.chat.completions.create.side_effect = [
+            Exception("429 Too Many Requests"),
+            fallback_response,
+        ]
+
+        self.llm.provider = "cerebras"
+        self.llm.client = client
+        self.llm.cerebras_tech_model = "gpt-oss-120b"
+        self.llm.cerebras_behavior_model = "zai-glm-4.7"
+
+        result = await self.llm.generate_answer(
+            ["[INTERVIEWER]: Explain AWS VPC design."],
+            "context",
+            question_type="technical"
+        )
+
+        self.assertEqual(result, "Cerebras fallback answer.")
+        calls = client.chat.completions.create.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "gpt-oss-120b")
+        self.assertEqual(calls[1].kwargs["model"], "zai-glm-4.7")
 
     async def test_generate_answer_regen_higher_temperature(self):
         """generate_answer_regen should call the API with temperature >= 0.5."""

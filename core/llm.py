@@ -5,6 +5,11 @@ import re
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 
+try:
+    from cerebras.cloud.sdk import Cerebras
+except ImportError:
+    Cerebras = None
+
 logger = logging.getLogger(__name__)
 
 classification_prompt = """Classify this interview transcript fragment.
@@ -52,13 +57,14 @@ Current accumulated interviewer text:
 class LLMClient:
     """
     Anti-hallucination LLM brain strictly generating 30-word bullet points.
-    Supports multiple providers: Groq and NVIDIA NIM.
+    Supports multiple providers: Groq, NVIDIA NIM, and Cerebras.
     """
     def __init__(self):
         self.provider = os.getenv("LLM_PROVIDER", "groq").lower()
         self.groq_key = os.getenv("GROQ_API_KEY")
         self.groq_backup_key = os.getenv("GROQ_BACKUP_API_KEY")
         self.nvidia_key = os.getenv("NVIDIA_API_KEY")
+        self.cerebras_key = os.getenv("CEREBRAS_API_KEY")
         self.client = None
         self.fallback_client = None
         self.groq_backup_client = None
@@ -71,6 +77,10 @@ class LLMClient:
 
         self.nvidia_tech_model = os.getenv("NVIDIA_TECHNICAL_MODEL", "meta/llama-3.3-70b-instruct")
         self.nvidia_behavior_model = os.getenv("NVIDIA_BEHAVIORAL_MODEL", "meta/llama-3.1-8b-instruct")
+
+        self.cerebras_tech_model = os.getenv("CEREBRAS_TECHNICAL_MODEL", "gpt-oss-120b")
+        self.cerebras_behavior_model = os.getenv("CEREBRAS_BEHAVIORAL_MODEL", "zai-glm-4.7")
+        self.cerebras_reasoning_effort = os.getenv("CEREBRAS_REASONING_EFFORT", "medium")
 
         self.answer_style = os.getenv("ANSWER_STYLE", "spoken").strip().lower()
         self.answer_max_bullets = os.getenv("ANSWER_MAX_BULLETS", "4").strip()
@@ -87,13 +97,24 @@ class LLMClient:
                     api_key=self.nvidia_key
                 )
 
+        if self.provider == "cerebras":
+            if not self.cerebras_key:
+                logger.warning("CEREBRAS_API_KEY not found in environment! Falling back to Groq.")
+                self.provider = "groq"
+            elif Cerebras is None:
+                logger.warning("cerebras_cloud_sdk not installed! Falling back to Groq.")
+                self.provider = "groq"
+            else:
+                logger.info(f"LLM Provider: Cerebras (Tech: {self.cerebras_tech_model})")
+                self.client = Cerebras(api_key=self.cerebras_key)
+
         if self.provider == "groq":
             if not self.groq_key:
                 logger.warning("GROQ_API_KEY not found in environment!")
             logger.info(f"LLM Provider: Groq (Tech: {self.groq_tech_model})")
             self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
 
-        if self.provider not in {"groq", "nvidia"}:
+        if self.provider not in {"groq", "nvidia", "cerebras"}:
             logger.warning("Unsupported LLM_PROVIDER=%s; falling back to Groq.", self.provider)
             self.provider = "groq"
             self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
@@ -103,12 +124,12 @@ class LLMClient:
         if self.groq_backup_key:
             self.groq_backup_client = AsyncGroq(api_key=self.groq_backup_key)
         
-        self.system_prompt = """You are acting AS the candidate in a real technical interview. You speak in **first person** as the candidate — "I", "my", "I've", "In my experience". You are NOT a coach giving tips.
+        self.system_prompt = """You are acting AS the candidate in a real interview. You speak in **first person** as the candidate - "I", "my", "I've", "In my experience". You are NOT a coach giving tips.
 
 ## CRITICAL RULES
 1. If the interviewer says only filler (yes/no/okay/right/good/thanks/hello/nice) with NO question — reply exactly with "SKIP".
-2. Speak as a Senior Engineer: confident, specific, and natural. NO generic intros like "I am familiar with..." or "Here are key aspects..."
-3. Start with substance immediately. Jump straight into the answer.
+2. Match the target role in the retrieved interview context. For technical roles, sound specific, practical, and seniority-appropriate; for non-technical roles, reduce jargon and explain clearly. Do not overstate seniority or experience.
+3. Start with one short natural bridge line, then move quickly into the answer.
 4. NEVER say "you should...", "candidates should...", or "it's important to...". Use ONLY "I", "my", "I've".
 5. Format DYNAMICALLY based on question type (see below). Adapt to what fits best.
 6. NEVER use STAR format for technical, architecture, troubleshooting, command, coding, cloud, Linux, DevOps, security, networking, database, or tool-comparison questions. Answer those directly.
@@ -118,6 +139,19 @@ class LLMClient:
 10. Keep answers concise but complete: 3-6 sentences or 3-5 bullet points max.
 11. Prefer answer cards over paragraphs: direct answer, key bullets, concrete proof/example, and optional verification/follow-up.
 6. Keep answers concise but complete — 3-6 sentences or 3-5 bullet points max.
+
+## NATURAL BRIDGE LINE
+The first line should be safe for the candidate to say immediately while the rest of the answer is still streaming.
+
+Good examples:
+- "Sure, I can walk through that."
+- "I would start by clarifying the goal and constraints."
+- "For me, the key is being structured and specific."
+- "That is something I would approach step by step."
+
+Vary the wording. Keep it to one sentence. Do not use a bridge line for coding answers where code is requested.
+
+Adapt examples to the target role from the retrieved context. Use portfolio experience naturally, and do not claim direct professional experience with a tool, platform, domain, or responsibility unless it appears in the portfolio or interview context.
 
 ---
 
@@ -316,7 +350,7 @@ Format most answers for natural speech, not reading. The candidate should be abl
 Use this structure unless the question explicitly asks for code:
 
 Opening:
-One short, natural sentence I can say immediately while I organize the answer.
+One short, natural bridge sentence I can say immediately while I organize the answer. Match the role and question type; for technical roles, keep it practical and specific rather than overly soft or scripted.
 
 Say:
 â–¸ {self.answer_max_bullets} or fewer short speakable bullets
@@ -331,6 +365,8 @@ Rules:
 - Do not produce long paragraphs.
 - Do not sound like a written article.
 - Do not include every possible detail; leave room for follow-up questions.
+- Use STAR internally for behavioral answers, but show labels only when they make the answer clearer.
+- Mention tools only when relevant and avoid claiming direct professional experience with a tool unless it appears in the context.
 - For troubleshooting, the first Say bullet should be the exact first command/check.
 - For architecture, cover only the highest-value components and one trade-off.
 - For behavioral questions, keep STAR but make each section one short spoken sentence.
@@ -366,6 +402,23 @@ Rules:
                 return self.nvidia_tech_model, 500
             else:
                 return self.nvidia_behavior_model, 300
+        elif self.provider == "cerebras":
+            if question_type:
+                if question_type in ["coding", "technical"]:
+                    return self.cerebras_tech_model, 500
+                elif question_type in ["behavioral", "followup"]:
+                    return self.cerebras_behavior_model, 300
+                else:
+                    return self.cerebras_behavior_model, 250
+
+            text_lower = question_text.lower()
+            is_technical = self._has_technical_keyword(text_lower)
+            if is_technical:
+                logger.info(f"Router: Technical question → {self.cerebras_tech_model}")
+                return self.cerebras_tech_model, 500
+            else:
+                logger.info(f"Router: Behavioral/HR question → {self.cerebras_behavior_model}")
+                return self.cerebras_behavior_model, 250
         else:
             # Groq model mapping
             if question_type:
@@ -448,12 +501,28 @@ Rules:
                 models.append(model)
         return models
 
+    def _cerebras_fallback_models(self, primary_model: str) -> list[str]:
+        """Return same-provider Cerebras fallback models."""
+        configured = os.getenv("CEREBRAS_FALLBACK_MODELS", "")
+        fallback_models = [m.strip() for m in configured.split(",") if m.strip()]
+        fallback_models.append(self.cerebras_behavior_model)
+
+        models = []
+        for model in fallback_models:
+            if model and model != primary_model and model not in models:
+                models.append(model)
+        return models
+
     def _model_attempts(self, primary_model: str) -> list[tuple[object, str, str]]:
         """
         Return primary provider attempt plus Groq fallback attempts.
         Each item is (client, provider_name, model).
         """
         attempts = [(self.client, self.provider, primary_model)]
+
+        if self.provider == "cerebras" and self.client:
+            for model in self._cerebras_fallback_models(primary_model):
+                attempts.append((self.client, "cerebras", model))
 
         groq_client = self.client if self.provider == "groq" else self.fallback_client
         if groq_client:
@@ -477,6 +546,54 @@ Rules:
                 logger.warning("Invalid GROQ_FALLBACK_MAX_TOKENS=%s; using default.", configured)
         return min(max_tokens, 350)
 
+    def _cerebras_params(self, max_tokens: int, temperature: float, stream: bool = False) -> dict:
+        """Translate common chat params to Cerebras SDK params."""
+        params = {
+            "max_completion_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": 1,
+            "stream": stream,
+        }
+        if self.cerebras_reasoning_effort:
+            params["reasoning_effort"] = self.cerebras_reasoning_effort
+        return params
+
+    async def _chat_completion_create(
+        self,
+        client,
+        provider: str,
+        model: str,
+        messages: list,
+        max_tokens: int,
+        temperature: float,
+        stream: bool = False,
+    ):
+        """Create a chat completion across supported provider SDKs."""
+        if provider == "cerebras":
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **self._cerebras_params(max_tokens, temperature, stream=stream),
+            )
+
+        return await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=stream,
+        )
+
+    async def _stream_chunks(self, stream):
+        """Yield chunks from either async or sync provider streams."""
+        if hasattr(stream, "__aiter__"):
+            async for chunk in stream:
+                yield chunk
+            return
+
+        for chunk in stream:
+            yield chunk
+
     async def classify_question(self, question_text: str) -> str:
         """
         Classify interview question into type: behavioral, technical, coding, followup, or filler.
@@ -485,17 +602,24 @@ Rules:
         if not self.client or len(question_text.strip()) < 3:
             return "behavioral"
 
-        classification_model = self.nvidia_behavior_model if self.provider == "nvidia" else self.groq_behavior_model
+        if self.provider == "nvidia":
+            classification_model = self.nvidia_behavior_model
+        elif self.provider == "cerebras":
+            classification_model = self.cerebras_behavior_model
+        else:
+            classification_model = self.groq_behavior_model
 
         try:
-            response = await self.client.chat.completions.create(
-                model=classification_model,
+            response = await self._chat_completion_create(
+                self.client,
+                self.provider,
+                classification_model,
                 messages=[
                     {"role": "system", "content": "You are a question classifier. Reply with only one word."},
                     {"role": "user", "content": classification_prompt.format(question=question_text[:200])}
                 ],
                 max_tokens=10,
-                temperature=0.0
+                temperature=0.0,
             )
             result = response.choices[0].message.content.strip().lower()
 
@@ -579,12 +703,19 @@ Rules:
         if not self.client or len((current_text or "").strip()) < 3:
             return fallback
 
-        model = self.nvidia_behavior_model if self.provider == "nvidia" else self.groq_behavior_model
+        if self.provider == "nvidia":
+            model = self.nvidia_behavior_model
+        elif self.provider == "cerebras":
+            model = self.cerebras_behavior_model
+        else:
+            model = self.groq_behavior_model
         history = "\n".join((transcript_history or [])[-8:])
 
         try:
-            response = await self.client.chat.completions.create(
-                model=model,
+            response = await self._chat_completion_create(
+                self.client,
+                self.provider,
+                model,
                 messages=[
                     {"role": "system", "content": "You are a strict JSON classifier for real-time interview turn-taking."},
                     {"role": "user", "content": turn_classification_prompt.format(
@@ -594,7 +725,7 @@ Rules:
                     )}
                 ],
                 max_tokens=120,
-                temperature=0.0
+                temperature=0.0,
             )
             raw = response.choices[0].message.content.strip()
             match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
@@ -660,11 +791,13 @@ Rules:
             try:
                 if index > 0:
                     logger.warning("Retrying LLM generation with %s fallback model: %s", attempt_provider, attempt_model)
-                response = await attempt_client.chat.completions.create(
-                    model=attempt_model,
+                response = await self._chat_completion_create(
+                    attempt_client,
+                    attempt_provider,
+                    attempt_model,
                     messages=messages,
                     max_tokens=attempt_max_tokens,
-                    temperature=0.2
+                    temperature=0.2,
                 )
 
                 output = response.choices[0].message.content.strip()
@@ -719,12 +852,14 @@ Rules:
 
         try:
             accumulated = ""
-            stream = await self.client.chat.completions.create(
-                model=model,
+            stream = await self._chat_completion_create(
+                self.client,
+                self.provider,
+                model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.2,
-                stream=True
+                stream=True,
             )
             async for chunk in stream:
                 if not chunk.choices:
@@ -785,14 +920,16 @@ Rules:
                 accumulated = ""
                 if index > 0:
                     logger.warning("Retrying LLM stream with %s fallback model: %s", attempt_provider, attempt_model)
-                stream = await attempt_client.chat.completions.create(
-                    model=attempt_model,
+                stream = await self._chat_completion_create(
+                    attempt_client,
+                    attempt_provider,
+                    attempt_model,
                     messages=messages,
                     max_tokens=attempt_max_tokens,
                     temperature=0.2,
-                    stream=True
+                    stream=True,
                 )
-                async for chunk in stream:
+                async for chunk in self._stream_chunks(stream):
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta.content
@@ -846,11 +983,13 @@ Rules:
             try:
                 if index > 0:
                     logger.warning("Retrying LLM regen with %s fallback model: %s", attempt_provider, attempt_model)
-                response = await attempt_client.chat.completions.create(
-                    model=attempt_model,
+                response = await self._chat_completion_create(
+                    attempt_client,
+                    attempt_provider,
+                    attempt_model,
                     messages=messages,
                     max_tokens=attempt_max_tokens,
-                    temperature=0.6  # Higher temperature = different answer each regen
+                    temperature=0.6,  # Higher temperature = different answer each regen
                 )
                 return response.choices[0].message.content.strip()
             except Exception as e:
@@ -901,17 +1040,24 @@ Output: YES
 Text: Tell me about yourself.
 Output: YES'''
 
-        gating_model = self.nvidia_behavior_model if self.provider == "nvidia" else self.groq_behavior_model
+        if self.provider == "nvidia":
+            gating_model = self.nvidia_behavior_model
+        elif self.provider == "cerebras":
+            gating_model = self.cerebras_behavior_model
+        else:
+            gating_model = self.groq_behavior_model
 
         try:
-            response = await self.client.chat.completions.create(
-                model=gating_model, # Ultra-fast model for gating
+            response = await self._chat_completion_create(
+                self.client,
+                self.provider,
+                gating_model, # Ultra-fast model for gating
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Text: {text}\nOutput:"}
                 ],
                 max_tokens=3, # We only need YES or NO
-                temperature=0.0 # Deterministic
+                temperature=0.0, # Deterministic
             )
             
             output = response.choices[0].message.content.strip().upper()
