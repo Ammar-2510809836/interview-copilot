@@ -141,6 +141,14 @@ class TestModelRouter(unittest.TestCase):
         self.assertIn("USER:\nhi", kwargs["contents"])
         self.assertIn("config", kwargs)
 
+    def test_gemini_empty_response_does_not_fall_through_to_choices(self):
+        """Real Gemini empty responses do not expose OpenAI-style choices."""
+        response = MagicMock()
+        response.__class__.__name__ = "GenerateContentResponse"
+        response.text = None
+
+        self.assertEqual(self.llm._response_text(response), "")
+
     def test_spoken_answer_style_is_enabled_by_default(self):
         """Default prompt should be optimized for live spoken delivery."""
         self.assertIn("SPOKEN LIVE INTERVIEW MODE", self.llm.system_prompt)

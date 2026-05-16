@@ -618,7 +618,7 @@ Rules:
         text = getattr(response, "text", None)
         if isinstance(text, str) and text:
             return str(text).strip()
-        if text is None:
+        if text is None or response.__class__.__name__ == "GenerateContentResponse":
             return ""
 
         try:
@@ -636,7 +636,7 @@ Rules:
         text = getattr(chunk, "text", None)
         if isinstance(text, str) and text:
             return str(text)
-        if text is None:
+        if text is None or chunk.__class__.__name__ == "GenerateContentResponse":
             return ""
 
         try:
