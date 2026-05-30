@@ -77,6 +77,7 @@ class TestModelRouter(unittest.TestCase):
 
         attempts = self.llm._model_attempts("llama-3.3-70b-versatile")
 
+        self.assertIn((backup_client, "groq_backup", "llama-3.3-70b-versatile"), attempts)
         self.assertIn((backup_client, "groq_backup", "llama-3.1-8b-instant"), attempts)
 
     def test_gemini_provider_routes_to_current_flash_models(self):

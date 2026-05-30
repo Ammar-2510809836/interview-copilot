@@ -499,7 +499,7 @@ Rules:
 
         models = []
         for model in fallback_models:
-            if model and model != primary_model and model not in models:
+            if model and model not in models:
                 models.append(model)
         return models
 
