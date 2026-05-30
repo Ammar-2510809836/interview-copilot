@@ -86,6 +86,8 @@ class LLMClient:
         self.answer_style = os.getenv("ANSWER_STYLE", "spoken").strip().lower()
         self.answer_max_bullets = os.getenv("ANSWER_MAX_BULLETS", "4").strip()
         self.answer_include_close = os.getenv("ANSWER_INCLUDE_CLOSE", "true").strip().lower() not in {"0", "false", "no"}
+        self.groq_timeout = self._env_float("GROQ_TIMEOUT", 15.0)
+        self.groq_max_retries = self._env_int("GROQ_MAX_RETRIES", 0)
 
         if self.provider == "nvidia":
             if not self.nvidia_key:
@@ -113,17 +115,17 @@ class LLMClient:
             if not self.groq_key:
                 logger.warning("GROQ_API_KEY not found in environment!")
             logger.info(f"LLM Provider: Groq (Tech: {self.groq_tech_model})")
-            self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
+            self.client = self._make_groq_client(self.groq_key) if self.groq_key else None
 
         if self.provider not in {"groq", "nvidia", "gemini"}:
             logger.warning("Unsupported LLM_PROVIDER=%s; falling back to Groq.", self.provider)
             self.provider = "groq"
-            self.client = AsyncGroq(api_key=self.groq_key) if self.groq_key else None
+            self.client = self._make_groq_client(self.groq_key) if self.groq_key else None
 
         if self.provider != "groq" and self.groq_key:
-            self.fallback_client = AsyncGroq(api_key=self.groq_key)
+            self.fallback_client = self._make_groq_client(self.groq_key)
         if self.groq_backup_key:
-            self.groq_backup_client = AsyncGroq(api_key=self.groq_backup_key)
+            self.groq_backup_client = self._make_groq_client(self.groq_backup_key)
         
         self.system_prompt = """You are acting AS the candidate in a real interview. You speak in **first person** as the candidate - "I", "my", "I've", "In my experience". You are NOT a coach giving tips.
 
@@ -334,6 +336,35 @@ For technical interviews, lead with the exact answer first, then add 2-4 precise
         'observability', 'monitoring', 'logging', 'alerting', 'incident',
         'kubernetes', 'pod', 'deployment', 'service', 'ingress', 'helm',
     }
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning("Invalid %s=%s; using %s.", name, value, default)
+            return default
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            logger.warning("Invalid %s=%s; using %s.", name, value, default)
+            return default
+
+    def _make_groq_client(self, api_key: str) -> AsyncGroq:
+        return AsyncGroq(
+            api_key=api_key,
+            timeout=self.groq_timeout,
+            max_retries=self.groq_max_retries,
+        )
 
     def _answer_style_prompt(self) -> str:
         """Optional answer-shaping instructions for live spoken interviews."""

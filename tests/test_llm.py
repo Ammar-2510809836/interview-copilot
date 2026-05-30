@@ -80,6 +80,31 @@ class TestModelRouter(unittest.TestCase):
         self.assertIn((backup_client, "groq_backup", "llama-3.3-70b-versatile"), attempts)
         self.assertIn((backup_client, "groq_backup", "llama-3.1-8b-instant"), attempts)
 
+    def test_groq_client_disables_sdk_retries_by_default(self):
+        """Fallback logic should run without the Groq SDK sleeping on 429 retries."""
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_PROVIDER": "groq",
+                "GROQ_API_KEY": "primary-test-key",
+                "GROQ_BACKUP_API_KEY": "backup-test-key",
+            },
+            clear=True,
+        ):
+            with patch("core.llm.AsyncGroq") as mock_groq:
+                LLMClient()
+
+        mock_groq.assert_any_call(
+            api_key="primary-test-key",
+            timeout=15.0,
+            max_retries=0,
+        )
+        mock_groq.assert_any_call(
+            api_key="backup-test-key",
+            timeout=15.0,
+            max_retries=0,
+        )
+
     def test_gemini_provider_routes_to_current_flash_models(self):
         """Gemini can be selected as a primary provider with current model ids."""
         with patch.dict(
