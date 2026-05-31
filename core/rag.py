@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class RAGManager:
     """
-    Lightweight in-process vector DB (ChromaDB) for portfolio ingestion.
+    Lightweight in-process vector DB (ChromaDB) for interview context ingestion.
     """
     def __init__(self, data_path: str):
         self.data_path = data_path
@@ -23,36 +23,62 @@ class RAGManager:
             embedding_function=self.embedding_fn
         )
 
-    def ingest_portfolio(self):
-        """
-        Reads, chunks, and embeds portfolio.md.
-        Focuses on AI, Python/OOP, IoT/Embedded, and Hardware logic.
-        """
+    def _context_files(self) -> list:
+        """Return markdown context files from the data directory, portfolio first."""
         if not os.path.exists(self.data_path):
             logger.warning(f"Portfolio file not found at {self.data_path}. Skipping ingestion.")
+            return []
+
+        data_dir = os.path.dirname(self.data_path)
+        paths = [self.data_path]
+
+        if os.path.isdir(data_dir):
+            for name in sorted(os.listdir(data_dir)):
+                path = os.path.join(data_dir, name)
+                if (
+                    path != self.data_path
+                    and name.lower().endswith(".md")
+                    and os.path.isfile(path)
+                ):
+                    paths.append(path)
+
+        return paths
+
+    def ingest_portfolio(self):
+        """
+        Reads, chunks, and embeds portfolio plus optional interview context files.
+        Any .md file placed next to portfolio.md is available for retrieval.
+        """
+        context_files = self._context_files()
+        if not context_files:
             return
 
         try:
-            with open(self.data_path, "r", encoding="utf-8") as f:
-                content = f.read()
+            documents = []
+            ids = []
 
-            # Simple chunking by paragraph/section
-            paragraphs = [p.strip() for p in content.split("\n\n") if len(p.strip()) > 20]
+            for path in context_files:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                source = os.path.basename(path)
+                paragraphs = [p.strip() for p in content.split("\n\n") if len(p.strip()) > 20]
+                for i, paragraph in enumerate(paragraphs):
+                    documents.append(f"[Source: {source}]\n{paragraph}")
+                    ids.append(f"{re.sub(r'[^a-zA-Z0-9_]+', '_', source)}_{i}")
             
-            if not paragraphs:
-                logger.warning("Portfolio is empty or poorly formatted. Skipped ingestion.")
+            if not documents:
+                logger.warning("Interview context files are empty or poorly formatted. Skipped ingestion.")
                 return
 
-            ids = [f"chunk_{i}" for i in range(len(paragraphs))]
-            
             self.collection.add(
-                documents=paragraphs,
+                documents=documents,
                 ids=ids
             )
-            logger.info(f"Successfully ingested {len(paragraphs)} chunks from {self.data_path} into ChromaDB.")
+            logger.info(f"Successfully ingested {len(documents)} chunks from {len(context_files)} context file(s) into ChromaDB.")
             
         except Exception as e:
-            logger.error(f"Failed to ingest portfolio: {e}")
+            logger.error(f"Failed to ingest interview context: {e}")
 
     # Chunks with L2 distance above this threshold are considered irrelevant
     # ChromaDB uses squared L2 by default: 0 = identical, 2 = max distance
