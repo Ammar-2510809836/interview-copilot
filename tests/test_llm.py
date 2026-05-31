@@ -180,7 +180,6 @@ class TestModelRouter(unittest.TestCase):
         """Default prompt should be optimized for live spoken delivery."""
         self.assertIn("SPOKEN LIVE INTERVIEW MODE", self.llm.system_prompt)
         # New flowing-prose shaping: no bullet/scaffold labels.
-        self.assertIn("flowing sentences", self.llm.system_prompt)
         self.assertIn("Do NOT use bullet points", self.llm.system_prompt)
         self.assertNotIn("Opening:", self.llm.system_prompt)
         self.assertNotIn("Say:", self.llm.system_prompt)

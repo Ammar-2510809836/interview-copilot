@@ -84,6 +84,8 @@ class LLMClient:
         self.gemini_behavior_model = os.getenv("GEMINI_BEHAVIORAL_MODEL", "gemini-2.5-flash-lite")
 
         self.answer_style = os.getenv("ANSWER_STYLE", "spoken").strip().lower()
+        # answer_max_bullets / answer_include_close: retained for env-compat; not used
+        # by the current flowing-prose prompt (see _answer_style_prompt).
         self.answer_max_bullets = os.getenv("ANSWER_MAX_BULLETS", "4").strip()
         self.answer_include_close = os.getenv("ANSWER_INCLUDE_CLOSE", "true").strip().lower() not in {"0", "false", "no"}
         self.groq_timeout = self._env_float("GROQ_TIMEOUT", 15.0)
