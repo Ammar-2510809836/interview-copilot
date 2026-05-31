@@ -12,6 +12,8 @@ substance.
 import random
 
 # A candidate never praises the interviewer's question; these must never appear.
+# Used only by the test suite to assert pool hygiene — not enforced at runtime,
+# since the pools are static source-controlled strings.
 BANNED_SUBSTRINGS = ("good question", "great question", "interesting question", "nice question")
 
 BRIDGE_POOLS = {
@@ -53,6 +55,9 @@ _CODING_CUES = (
     "big o", "data structure", "solve this", "code this",
 )
 
+# Broad phrases like "what is"/"explain" live here intentionally: _classify checks
+# behavioral first, so a behavioral question containing them still routes correctly.
+# Keep technical LAST in the if-chain if you reorder _classify.
 _TECHNICAL_CUES = (
     "design", "architecture", "scalable", "scale", "kubernetes", "docker",
     "aws", "cloud", "database", "sql", "api", "latency", "throughput",

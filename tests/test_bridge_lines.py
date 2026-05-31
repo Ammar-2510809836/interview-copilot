@@ -1,9 +1,15 @@
 import unittest
 
+import core.bridge_lines as bridge_lines
 from core.bridge_lines import pick_bridge_line, BANNED_SUBSTRINGS, BRIDGE_POOLS
 
 
 class TestBridgeLines(unittest.TestCase):
+    def setUp(self):
+        # pick_bridge_line keeps anti-repeat state in a module global; reset it
+        # so tests don't depend on execution order.
+        bridge_lines._last_line = None
+
     def test_behavioral_question_uses_behavioral_pool(self):
         line = pick_bridge_line("Tell me about a time you handled conflict on your team.")
         self.assertIn(line, BRIDGE_POOLS["behavioral"])
