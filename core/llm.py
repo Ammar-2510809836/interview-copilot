@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import re
+import inspect
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 
@@ -542,6 +543,27 @@ I am speaking these words out loud in a live interview, so they must sound like 
         for chunk in stream:
             yield chunk
 
+    async def _aclose_stream(self, stream) -> None:
+        """Best-effort close of a provider stream.
+
+        When the consumer breaks out early (interviewer interruption) the async
+        generator gets GeneratorExit; if the underlying httpx stream isn't closed
+        here it gets cleaned up later from a different task, raising
+        'Attempted to exit cancel scope in a different task'. Closing it in this
+        task avoids that noise.
+        """
+        for name in ("aclose", "close"):
+            closer = getattr(stream, name, None)
+            if closer is None:
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
+            return
+
     def _response_text(self, response) -> str:
         """Extract assistant text defensively across provider response shapes."""
         text = getattr(response, "text", None)
@@ -857,19 +879,22 @@ I am speaking these words out loud in a live interview, so they must sound like 
                 temperature=0.2,
                 stream=True,
             )
-            async for chunk in stream:
-                # Skip Groq/OpenAI empty-choices chunks; Gemini chunks have no
-                # .choices and must fall through to _chunk_text (which reads .text).
-                if getattr(chunk, "choices", None) is not None and not chunk.choices:
-                    continue
-                delta = self._chunk_text(chunk)
-                if delta:
-                    accumulated += delta
-                    # Early SKIP detection — if first tokens spell SKIP, abort
-                    if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
-                        yield "__SKIP__"
-                        return
-                    yield delta
+            try:
+                async for chunk in self._stream_chunks(stream):
+                    # Skip Groq/OpenAI empty-choices chunks; Gemini chunks have no
+                    # .choices and must fall through to _chunk_text (which reads .text).
+                    if getattr(chunk, "choices", None) is not None and not chunk.choices:
+                        continue
+                    delta = self._chunk_text(chunk)
+                    if delta:
+                        accumulated += delta
+                        # Early SKIP detection — if first tokens spell SKIP, abort
+                        if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
+                            yield "__SKIP__"
+                            return
+                        yield delta
+            finally:
+                await self._aclose_stream(stream)
 
         except Exception as e:
             logger.error(f"LLM Stream failed: {e}")
@@ -927,18 +952,21 @@ I am speaking these words out loud in a live interview, so they must sound like 
                     temperature=0.2,
                     stream=True,
                 )
-                async for chunk in self._stream_chunks(stream):
-                    # Skip Groq/OpenAI empty-choices chunks; Gemini chunks have no
-                    # .choices and must fall through to _chunk_text (reads .text).
-                    if getattr(chunk, "choices", None) is not None and not chunk.choices:
-                        continue
-                    delta = self._chunk_text(chunk)
-                    if delta:
-                        accumulated += delta
-                        if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
-                            yield "__SKIP__"
-                            return
-                        yield delta
+                try:
+                    async for chunk in self._stream_chunks(stream):
+                        # Skip Groq/OpenAI empty-choices chunks; Gemini chunks have no
+                        # .choices and must fall through to _chunk_text (reads .text).
+                        if getattr(chunk, "choices", None) is not None and not chunk.choices:
+                            continue
+                        delta = self._chunk_text(chunk)
+                        if delta:
+                            accumulated += delta
+                            if len(accumulated) <= 8 and "SKIP" in accumulated.strip().upper():
+                                yield "__SKIP__"
+                                return
+                            yield delta
+                finally:
+                    await self._aclose_stream(stream)
                 if not accumulated.strip():
                     raise ValueError("LLM stream returned empty content")
                 return

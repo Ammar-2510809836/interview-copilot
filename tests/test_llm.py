@@ -471,6 +471,34 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("__SKIP__", tokens)
 
+    async def test_stream_closed_when_generator_aclosed(self):
+        """Interruption: closing the generator must close the provider stream
+        (otherwise httpx cleans it up from a different task and raises)."""
+        chunks = self._make_stream_chunks(["Hello", " there", " friend"])
+        closed = []
+
+        class FakeStream:
+            def __aiter__(self_inner):
+                async def gen():
+                    for c in chunks:
+                        yield c
+                return gen()
+
+            async def aclose(self_inner):
+                closed.append(True)
+
+        self.llm.client = AsyncMock()
+        self.llm.client.chat.completions.create = AsyncMock(return_value=FakeStream())
+
+        agen = self.llm.generate_answer_stream(
+            ["[INTERVIEWER]: Tell me about yourself."], "context", question_type="behavioral"
+        )
+        async for _token in agen:
+            break  # consumer interrupts after the first token
+        await agen.aclose()  # what contextlib.aclosing() does in main.py
+
+        self.assertEqual(len(closed), 1)
+
     async def test_stream_no_api_key(self):
         """With no API key, stream should yield an error string."""
         self.llm.client = None

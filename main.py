@@ -9,6 +9,7 @@ import re
 import time
 import json
 import asyncio
+import contextlib
 import logging
 import threading
 import qasync
@@ -276,28 +277,31 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
             chat_max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1400"))
         except ValueError:
             chat_max_tokens = 1400
-        async for token in llm_client.generate_answer_stream(
+        # aclosing() guarantees the generator (and its httpx stream) is closed in
+        # this task when we break, avoiding cross-task GeneratorExit tracebacks.
+        async with contextlib.aclosing(llm_client.generate_answer_stream(
             transcript_history,
             context,
             question_type=q_type,
             is_followup=is_followup,
             conversation_summary=conversation_state["conversation_summary"],
             max_tokens_override=chat_max_tokens
-        ):
-            if token == "__SKIP__":
-                skipped = True
-                break
-            answer_clean += token
-            batch_buffer += token
-            if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
-                # Raw text — update_text/format_structured_answer escapes it.
-                ui_overlay.update_text(
-                    answer_clean,
-                    question_type=q_type if q_type else "generic",
-                    is_streaming=True
-                )
-                batch_buffer = ""
-                await asyncio.sleep(0.03)
+        )) as answer_stream:
+            async for token in answer_stream:
+                if token == "__SKIP__":
+                    skipped = True
+                    break
+                answer_clean += token
+                batch_buffer += token
+                if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                    # Raw text — update_text/format_structured_answer escapes it.
+                    ui_overlay.update_text(
+                        answer_clean,
+                        question_type=q_type if q_type else "generic",
+                        is_streaming=True
+                    )
+                    batch_buffer = ""
+                    await asyncio.sleep(0.03)
 
         ui_overlay.set_typing_indicator(False)
 
@@ -623,60 +627,64 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # Show typing indicator
                     ui_overlay.set_typing_indicator(True)
 
-                    async for token in llm_client.generate_answer_stream(
+                    # aclosing() guarantees the generator (and its httpx stream) is
+                    # closed in this task on interruption/break, avoiding cross-task
+                    # GeneratorExit tracebacks.
+                    async with contextlib.aclosing(llm_client.generate_answer_stream(
                         transcript_history, context,
                         question_type=q_type,
                         is_followup=is_followup,
                         conversation_summary=conversation_state["conversation_summary"]
-                    ):
-                        # Zara-style AI interviewers can interrupt while the copilot is
-                        # still streaming. Drain any queued transcript immediately and
-                        # stop answering the stale question if the interviewer speaks.
-                        while True:
-                            try:
-                                tag_live, sentence_live = transcription_engine.text_queue.get_nowait()
-                            except asyncio.QueueEmpty:
+                    )) as answer_stream:
+                        async for token in answer_stream:
+                            # Zara-style AI interviewers can interrupt while the copilot is
+                            # still streaming. Drain any queued transcript immediately and
+                            # stop answering the stale question if the interviewer speaks.
+                            while True:
+                                try:
+                                    tag_live, sentence_live = transcription_engine.text_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+
+                                session_logger.info(f"{tag_live}: {sentence_live}")
+                                message_live = f"{tag_live}: {sentence_live}"
+                                transcript_history.append(message_live)
+                                if len(transcript_history) > 30:
+                                    transcript_history.pop(0)
+
+                                if tag_live == "[INTERVIEWER]":
+                                    logger.info("Interruption detected while streaming. Stopping current answer.")
+                                    interrupted = True
+                                    interviewer_accumulator.clear()
+                                    interviewer_accumulator.append(sentence_live)
+                                    last_question = sentence_live
+                                    last_advice = "<i style='color:#888888'>Listening to interviewer...</i>"
+                                    interviewer_start_time = time.time()
+                                    last_speech_time = time.time()
+                                    break
+                                elif tag_live == "[ME]":
+                                    me_accumulator.append(sentence_live)
+
+                            if interrupted:
                                 break
 
-                            session_logger.info(f"{tag_live}: {sentence_live}")
-                            message_live = f"{tag_live}: {sentence_live}"
-                            transcript_history.append(message_live)
-                            if len(transcript_history) > 30:
-                                transcript_history.pop(0)
-
-                            if tag_live == "[INTERVIEWER]":
-                                logger.info("Interruption detected while streaming. Stopping current answer.")
-                                interrupted = True
-                                interviewer_accumulator.clear()
-                                interviewer_accumulator.append(sentence_live)
-                                last_question = sentence_live
-                                last_advice = "<i style='color:#888888'>Listening to interviewer...</i>"
-                                interviewer_start_time = time.time()
-                                last_speech_time = time.time()
+                            if token == "__SKIP__":
+                                skipped = True
                                 break
-                            elif tag_live == "[ME]":
-                                me_accumulator.append(sentence_live)
-
-                        if interrupted:
-                            break
-
-                        if token == "__SKIP__":
-                            skipped = True
-                            break
-                        answer_clean += token
-                        batch_buffer += token
-                        # Update UI with raw text every ~8 chars or at sentence boundaries
-                        if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
-                            # Pass raw text — update_text/format_structured_answer
-                            # html.escape()s it. Pre-escaping here double-escaped any
-                            # answer containing < or > (e.g. code, List<int>).
-                            ui_overlay.update_text(
-                                answer_clean,
-                                question_type=q_type if q_type else "generic",
-                                is_streaming=True
-                            )
-                            batch_buffer = ""
-                            await asyncio.sleep(0.03)  # Give Qt time to repaint
+                            answer_clean += token
+                            batch_buffer += token
+                            # Update UI with raw text every ~8 chars or at sentence boundaries
+                            if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                                # Pass raw text — update_text/format_structured_answer
+                                # html.escape()s it. Pre-escaping here double-escaped any
+                                # answer containing < or > (e.g. code, List<int>).
+                                ui_overlay.update_text(
+                                    answer_clean,
+                                    question_type=q_type if q_type else "generic",
+                                    is_streaming=True
+                                )
+                                batch_buffer = ""
+                                await asyncio.sleep(0.03)  # Give Qt time to repaint
 
                     # Hide typing indicator
                     ui_overlay.set_typing_indicator(False)
