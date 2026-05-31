@@ -609,6 +609,32 @@ class TestSpokenPrompt(unittest.TestCase):
         self.assertEqual(prompt, "")
 
 
+class TestInterviewModePrompt(unittest.TestCase):
+    """INTERVIEW_MODE gates the heavy technical templates to save tokens."""
+
+    def test_default_mode_is_lean_without_heavy_technical_templates(self):
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("INTERVIEW_MODE", None)
+            with patch("core.llm.AsyncGroq"):
+                llm = LLMClient()
+        sp = llm.system_prompt
+        # Heavy, role-specific verbatim blocks are excluded by default.
+        self.assertNotIn("Security Group vs Network ACL", sp)
+        self.assertNotIn("sudo ss -tlnp", sp)
+        # Core guidance is retained.
+        self.assertIn("Match the target role", sp)
+        # Lean prompt is far smaller than the old ~11k-char prompt.
+        self.assertLess(len(sp), 6000)
+
+    def test_technical_mode_restores_technical_templates(self):
+        with patch.dict("os.environ", {"INTERVIEW_MODE": "technical"}, clear=False):
+            with patch("core.llm.AsyncGroq"):
+                llm = LLMClient()
+        sp = llm.system_prompt
+        self.assertIn("Security Group", sp)
+        self.assertIn("sudo ss -tlnp", sp)
+
+
 class TestProviderResponseParsing(unittest.TestCase):
     """_response_text / _chunk_text must extract Groq/OpenAI content, not just Gemini.
 
