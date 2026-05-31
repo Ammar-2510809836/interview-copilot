@@ -9,6 +9,7 @@ import re
 import time
 import json
 import asyncio
+import contextlib
 import logging
 import threading
 import qasync
@@ -19,6 +20,8 @@ from core.capture import CaptureEngine
 from core.transcription import TranscriptionEngine
 from core.rag import RAGManager
 from core.llm import LLMClient
+from core.turn_detection import decide_turn_action, recommended_wait_timeout
+from core.bridge_lines import pick_bridge_line
 import logging.handlers
 from ui.overlay import UIOverlay, create_app
 
@@ -257,7 +260,14 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
         is_followup = is_followup_question(q_text, conversation_state["previous_question"])
 
         context = rag_manager.retrieve_context(q_text, conversation_history=transcript_history)
-        answer_clean = ""
+        # Instant opener so the chat path shows a starter line like the live path.
+        bridge_line = pick_bridge_line(q_text, is_followup)
+        ui_overlay.update_text(
+            bridge_line,
+            question_type=q_type if q_type else "generic",
+            is_streaming=True,
+        )
+        answer_clean = bridge_line + " "
         skipped = False
         batch_buffer = ""
         BATCH_CHARS = 8
@@ -267,27 +277,31 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
             chat_max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1400"))
         except ValueError:
             chat_max_tokens = 1400
-        async for token in llm_client.generate_answer_stream(
+        # aclosing() guarantees the generator (and its httpx stream) is closed in
+        # this task when we break, avoiding cross-task GeneratorExit tracebacks.
+        async with contextlib.aclosing(llm_client.generate_answer_stream(
             transcript_history,
             context,
             question_type=q_type,
             is_followup=is_followup,
             conversation_summary=conversation_state["conversation_summary"],
             max_tokens_override=chat_max_tokens
-        ):
-            if token == "__SKIP__":
-                skipped = True
-                break
-            answer_clean += token
-            batch_buffer += token
-            if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
-                ui_overlay.update_text(
-                    answer_clean.replace('<', '&lt;').replace('>', '&gt;'),
-                    question_type=q_type if q_type else "generic",
-                    is_streaming=True
-                )
-                batch_buffer = ""
-                await asyncio.sleep(0.03)
+        )) as answer_stream:
+            async for token in answer_stream:
+                if token == "__SKIP__":
+                    skipped = True
+                    break
+                answer_clean += token
+                batch_buffer += token
+                if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                    # Raw text — update_text/format_structured_answer escapes it.
+                    ui_overlay.update_text(
+                        answer_clean,
+                        question_type=q_type if q_type else "generic",
+                        is_streaming=True
+                    )
+                    batch_buffer = ""
+                    await asyncio.sleep(0.03)
 
         ui_overlay.set_typing_indicator(False)
 
@@ -311,27 +325,12 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
 
         update_ui()
 
-    # Set of words that indicate a sentence is cut off mid-thought
-    # If the accumulated text ends with one of these, keep listening
-    DANGLING_WORDS = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'so', 'if', 'when', 'while',
-        'because', 'since', 'although', 'with', 'without', 'using', 'by',
-        'for', 'from', 'to', 'in', 'on', 'at', 'of', 'about', 'into',
-        'through', 'during', 'before', 'after', 'between', 'under', 'over',
-        'is', 'are', 'was', 'were', 'be', 'been', 'being',
-        'has', 'have', 'had', 'do', 'does', 'did',
-        'will', 'would', 'could', 'should', 'might', 'may', 'can',
-        'that', 'which', 'who', 'whom', 'whose', 'where', 'what',
-        'we', 'they', 'i', 'you', 'he', 'she', 'it', 'our', 'their', 'my',
-        'this', 'these', 'those', 'then', 'than', 'also', 'very',
-        'not', 'just', 'only', 'even', 'still', 'already',
-        'like', 'such', 'each', 'every', 'both', 'either', 'neither',
-        'regarding', 'concerning', 'including', 'especially', 'specifically',
-    }
-
     # Track when the interviewer started speaking for max-wait safety valve
     interviewer_start_time = None
-    
+    # Track the interviewer's most recent word, so pauses are measured as the
+    # silence gap since the last chunk rather than total turn duration.
+    last_speech_time = None
+
     # Tracks the last full question that was answered, so if the interviewer
     # continues speaking right after we answered, we can prepend the context
     last_answered_question = ""
@@ -364,6 +363,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         logger.info(f"Hotkey: Manual trigger fired! Forcing LLM call.")
                         interviewer_accumulator.clear()
                         interviewer_start_time = None
+                        last_speech_time = None
                         last_advice = "<i style='color:#888888'>Copilot Thinking (Manual)...</i>"
                         update_ui()
 
@@ -378,6 +378,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         )
                         answer_clean = answer.strip() if answer else ""
                         if answer_clean and not answer_clean.startswith("Error"):
+                            # Prepend the same natural opener as the auto path so the
+                            # starter line shows consistently on manual triggers too.
+                            answer_clean = f"{pick_bridge_line(q_text, is_followup)} {answer_clean}"
                             session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
                             last_advice = answer_clean
                             transcript_history.append(f"[COPILOT]: {answer_clean}")
@@ -436,13 +439,19 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                 continue
 
             try:
-                # Wait for incoming transcriptions.
-                # 3.5s timeout â€” long enough for natural interviewer pauses between sentences.
+                # Wait for incoming transcriptions. Once interviewer text exists,
+                # use adaptive timeouts so complete questions answer quickly while
+                # dangling fragments still get a longer continuation window.
+                pending_question = " ".join(interviewer_accumulator)
+                silence_timeout = recommended_wait_timeout(
+                    pending_question,
+                    conversation_state["previous_question"],
+                )
                 transcript_task = asyncio.create_task(transcription_engine.text_queue.get())
                 manual_task = asyncio.create_task(manual_question_queue.get())
                 done, pending = await asyncio.wait(
                     {transcript_task, manual_task},
-                    timeout=3.5,
+                    timeout=silence_timeout,
                     return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in pending:
@@ -494,82 +503,70 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # Start the max-wait timer when the interviewer first speaks
                     if interviewer_start_time is None:
                         interviewer_start_time = time.time()
-                    
+                    # Refresh the silence clock on every interviewer chunk so the
+                    # pause is measured from their last word, not the turn start.
+                    last_speech_time = time.time()
+
                 elif tag == "[ME]":
                     me_accumulator.append(sentence)
                     interviewer_start_time = None  # Reset timer when user speaks
+                    last_speech_time = None
                     # We no longer call update_ui() here so user voice is hidden from the overlay
 
             except asyncio.TimeoutError:
-                # 2.5 seconds of silence detected.
-                # If the interviewer was the last one to speak, check if their thought is complete!
+                # Adaptive silence detected. If the interviewer was the last one
+                # to speak, check if their thought is complete.
                 if interviewer_accumulator:
                     q_text = " ".join(interviewer_accumulator)
-                    time_waited = time.time() - interviewer_start_time if interviewer_start_time else 0
-                    
-                    # --- RULE-BASED END-OF-TURN DETECTION ---
-                    words = q_text.strip().split()
-                    
-                    # Gate 1: Minimum word count - no real question is under 4 words
-                    if len(words) < 4 and time_waited < 12.0:
-                        logger.info(f"Rule Gate: Too few words ({len(words)}). Continuing to listen...")
-                        continue
-                    
-                    # Gate 2: Comma-aware - speaker is listing items, not done yet
-                    if q_text.strip().endswith(',') and time_waited < 12.0:
-                        logger.info(f"Rule Gate: Trailing comma detected. Continuing to listen...")
-                        continue
-                    
-                    # Gate 3: Dangling word check - last word is a preposition/conjunction
-                    last_word = words[-1].lower().rstrip('.,!?;:') if words else ""
-                    if last_word in DANGLING_WORDS and time_waited < 12.0:
-                        logger.info(f"Rule Gate: Dangling word '{last_word}' detected. Continuing to listen...")
-                        continue
-                    
-                    if time_waited >= 12.0:
-                        logger.info(f"Rule Gate: Max wait (12s) reached. Forcing answer generation.")
-                    else:
-                        # --- COOLDOWN WINDOW ---
-                        # All gates passed, but wait 3.0s more to see if interviewer keeps talking.
-                        # This catches compound questions and natural pauses between sentences.
-                        try:
-                            tag2, sentence2 = await asyncio.wait_for(
-                                transcription_engine.text_queue.get(), timeout=3.0
-                            )
-                            # Someone spoke during cooldown!
-                            session_logger.info(f"{tag2}: {sentence2}")
-                            message2 = f"{tag2}: {sentence2}"
-                            transcript_history.append(message2)
-                            if len(transcript_history) > 30:
-                                transcript_history.pop(0)
-                                
-                            if tag2 == "[INTERVIEWER]":
-                                # Interviewer is still going! Accumulate and restart the loop.
-                                interviewer_accumulator.append(sentence2)
-                                last_question = " ".join(interviewer_accumulator)
-                                update_ui()
-                                logger.info("Cooldown: Interviewer still speaking. Continuing to listen...")
-                                continue
-                            elif tag2 == "[ME]":
-                                me_accumulator.append(sentence2)
-                                # User started speaking during cooldown â€” generate answer NOW
-                                logger.info("Cooldown: User started speaking. Generating answer immediately.")
-                        except asyncio.TimeoutError:
-                            # 3.0s of confirmed silence after gates passed â€” commit to answer
-                            logger.info("Cooldown: Confirmed silence. Generating answer.")
-                        
-                    turn = await llm_client.classify_turn(
+                    # Silence gap since the interviewer's last word — this is the
+                    # signal for "have they paused long enough", not turn length.
+                    pause = time.time() - last_speech_time if last_speech_time else 0
+
+                    decision = decide_turn_action(
                         q_text,
-                        transcript_history=transcript_history,
-                        previous_question=conversation_state["previous_question"],
-                        was_answering=False
+                        pause,
+                        conversation_state["previous_question"],
                     )
                     logger.info(
-                        "Turn classifier: intent=%s answer_now=%s confidence=%.2f",
-                        turn.get("intent"),
-                        turn.get("should_answer_now"),
-                        turn.get("confidence", 0.0)
+                        "Turn decision: reason=%s answer=%s force=%s pause=%.2fs",
+                        decision.reason,
+                        decision.should_answer,
+                        decision.force,
+                        pause,
                     )
+
+                    if not decision.should_answer:
+                        logger.info("Turn decision: continuing to listen.")
+                        continue
+
+                    if decision.force:
+                        logger.info("Turn decision: max wait reached. Forcing answer generation.")
+                        turn = {
+                            "intent": "new_question",
+                            "should_answer_now": True,
+                            "confidence": 1.0,
+                            "clean_question": q_text,
+                        }
+                    elif decision.reason == "ambiguous_pause":
+                        turn = await llm_client.classify_turn(
+                            q_text,
+                            transcript_history=transcript_history,
+                            previous_question=conversation_state["previous_question"],
+                            was_answering=False
+                        )
+                        logger.info(
+                            "Turn classifier: intent=%s answer_now=%s confidence=%.2f",
+                            turn.get("intent"),
+                            turn.get("should_answer_now"),
+                            turn.get("confidence", 0.0)
+                        )
+                    else:
+                        turn = {
+                            "intent": "followup" if decision.reason == "short_followup" else "new_question",
+                            "should_answer_now": True,
+                            "confidence": 0.9,
+                            "clean_question": q_text,
+                        }
 
                     if not turn.get("should_answer_now", False):
                         intent = turn.get("intent")
@@ -577,6 +574,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                             logger.info("Turn classifier: conversational filler. Clearing interviewer buffer.")
                             interviewer_accumulator.clear()
                             interviewer_start_time = None
+                            last_speech_time = None
                             last_question = ""
                             last_advice = "<i style='color:#888888'>(Listening)</i>"
                             update_ui()
@@ -592,6 +590,7 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     last_answer_time = time.time()
                     interviewer_accumulator.clear() # Clear so we don't re-trigger
                     interviewer_start_time = None  # Reset timer
+                    last_speech_time = None
 
                     # --- QUESTION CLASSIFICATION & FOLLOW-UP DETECTION ---
                     q_type = await llm_client.classify_question(q_text)
@@ -603,14 +602,23 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     if is_followup:
                         logger.info(f"Detected follow-up question to: '{conversation_state['previous_question'][:50]}...'")
 
-                    last_advice = "<i style='color:#888888'>Copilot Thinking...</i>"
-                    update_ui()
+                    # Instant thinking-bridge: show a natural opener the moment the
+                    # interviewer stops, so the candidate can start talking while the
+                    # real answer generates. The spoken prompt emits no opener of its
+                    # own, so the streamed text continues this line as one turn.
+                    bridge_line = pick_bridge_line(q_text, is_followup)
+                    ui_overlay.update_text(
+                        bridge_line,
+                        question_type=q_type if q_type else "generic",
+                        is_streaming=True,
+                    )
 
                     # Fetch RAG with conversation history
                     context = rag_manager.retrieve_context(q_text, conversation_history=transcript_history)
 
                     # --- STREAMING GENERATION ---
-                    answer_clean = ""
+                    # Seed with the bridge so streamed tokens append after it.
+                    answer_clean = bridge_line + " "
                     skipped = False
                     interrupted = False
                     batch_buffer = ""
@@ -619,57 +627,64 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                     # Show typing indicator
                     ui_overlay.set_typing_indicator(True)
 
-                    async for token in llm_client.generate_answer_stream(
+                    # aclosing() guarantees the generator (and its httpx stream) is
+                    # closed in this task on interruption/break, avoiding cross-task
+                    # GeneratorExit tracebacks.
+                    async with contextlib.aclosing(llm_client.generate_answer_stream(
                         transcript_history, context,
                         question_type=q_type,
                         is_followup=is_followup,
                         conversation_summary=conversation_state["conversation_summary"]
-                    ):
-                        # Zara-style AI interviewers can interrupt while the copilot is
-                        # still streaming. Drain any queued transcript immediately and
-                        # stop answering the stale question if the interviewer speaks.
-                        while True:
-                            try:
-                                tag_live, sentence_live = transcription_engine.text_queue.get_nowait()
-                            except asyncio.QueueEmpty:
+                    )) as answer_stream:
+                        async for token in answer_stream:
+                            # Zara-style AI interviewers can interrupt while the copilot is
+                            # still streaming. Drain any queued transcript immediately and
+                            # stop answering the stale question if the interviewer speaks.
+                            while True:
+                                try:
+                                    tag_live, sentence_live = transcription_engine.text_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+
+                                session_logger.info(f"{tag_live}: {sentence_live}")
+                                message_live = f"{tag_live}: {sentence_live}"
+                                transcript_history.append(message_live)
+                                if len(transcript_history) > 30:
+                                    transcript_history.pop(0)
+
+                                if tag_live == "[INTERVIEWER]":
+                                    logger.info("Interruption detected while streaming. Stopping current answer.")
+                                    interrupted = True
+                                    interviewer_accumulator.clear()
+                                    interviewer_accumulator.append(sentence_live)
+                                    last_question = sentence_live
+                                    last_advice = "<i style='color:#888888'>Listening to interviewer...</i>"
+                                    interviewer_start_time = time.time()
+                                    last_speech_time = time.time()
+                                    break
+                                elif tag_live == "[ME]":
+                                    me_accumulator.append(sentence_live)
+
+                            if interrupted:
                                 break
 
-                            session_logger.info(f"{tag_live}: {sentence_live}")
-                            message_live = f"{tag_live}: {sentence_live}"
-                            transcript_history.append(message_live)
-                            if len(transcript_history) > 30:
-                                transcript_history.pop(0)
-
-                            if tag_live == "[INTERVIEWER]":
-                                logger.info("Interruption detected while streaming. Stopping current answer.")
-                                interrupted = True
-                                interviewer_accumulator.clear()
-                                interviewer_accumulator.append(sentence_live)
-                                last_question = sentence_live
-                                last_advice = "<i style='color:#888888'>Listening to interviewer...</i>"
-                                interviewer_start_time = time.time()
+                            if token == "__SKIP__":
+                                skipped = True
                                 break
-                            elif tag_live == "[ME]":
-                                me_accumulator.append(sentence_live)
-
-                        if interrupted:
-                            break
-
-                        if token == "__SKIP__":
-                            skipped = True
-                            break
-                        answer_clean += token
-                        batch_buffer += token
-                        # Update UI with raw text every ~8 chars or at sentence boundaries
-                        if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
-                            # Show raw text during streaming with question type
-                            ui_overlay.update_text(
-                                answer_clean.replace('<','&lt;').replace('>','&gt;'),
-                                question_type=q_type if q_type else "generic",
-                                is_streaming=True
-                            )
-                            batch_buffer = ""
-                            await asyncio.sleep(0.03)  # Give Qt time to repaint
+                            answer_clean += token
+                            batch_buffer += token
+                            # Update UI with raw text every ~8 chars or at sentence boundaries
+                            if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                                # Pass raw text — update_text/format_structured_answer
+                                # html.escape()s it. Pre-escaping here double-escaped any
+                                # answer containing < or > (e.g. code, List<int>).
+                                ui_overlay.update_text(
+                                    answer_clean,
+                                    question_type=q_type if q_type else "generic",
+                                    is_streaming=True
+                                )
+                                batch_buffer = ""
+                                await asyncio.sleep(0.03)  # Give Qt time to repaint
 
                     # Hide typing indicator
                     ui_overlay.set_typing_indicator(False)
@@ -681,7 +696,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         continue
                     elif skipped:
                         logger.info("LLM skipped conversational filler.")
-                        last_advice = "<i style='color:#888888'>(Skipped conversational filler)</i>"
+                        # Replace the already-shown bridge with a cleared listening
+                        # state so no dangling opener line is left on the overlay.
+                        last_advice = "<i style='color:#888888'>(Listening)</i>"
                     elif answer_clean.startswith("Error"):
                         logger.error(f"LLM Error detected: {answer_clean}")
                         last_advice = f"<span style='color:#ff6b6b'>âš  {answer_clean}</span>"

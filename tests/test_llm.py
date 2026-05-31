@@ -3,12 +3,26 @@ Unit tests for core/llm.py — LLMClient model routing and mocked API calls.
 All Groq API calls are mocked — no real API key required to run these tests.
 """
 import asyncio
+import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 # chromadb must be imported before PyQt6 to avoid DLL conflicts on Windows
 import chromadb
 from core.llm import LLMClient
+
+
+class GenerateContentResponse:  # noqa: N801 - mirrors google-genai's real class name
+    """Faithful stand-in for a google-genai response/stream chunk.
+
+    Real Gemini objects expose `.text` (and have no `.choices`); the response
+    parser discriminates providers by this class name. Using a generic MagicMock
+    here would falsely expose `.choices`, so tests must use this shape.
+    """
+
+    def __init__(self, text):
+        self.text = text
 
 
 class TestModelRouter(unittest.TestCase):
@@ -178,9 +192,11 @@ class TestModelRouter(unittest.TestCase):
     def test_spoken_answer_style_is_enabled_by_default(self):
         """Default prompt should be optimized for live spoken delivery."""
         self.assertIn("SPOKEN LIVE INTERVIEW MODE", self.llm.system_prompt)
-        self.assertIn("Opening:", self.llm.system_prompt)
-        self.assertIn("Say:", self.llm.system_prompt)
-        self.assertIn("Close:", self.llm.system_prompt)
+        # New flowing-prose shaping: no bullet/scaffold labels.
+        self.assertIn("Do NOT use bullet points", self.llm.system_prompt)
+        self.assertNotIn("Opening:", self.llm.system_prompt)
+        self.assertNotIn("Say:", self.llm.system_prompt)
+        self.assertNotIn("Close:", self.llm.system_prompt)
 
     def test_system_prompt_keeps_role_adaptation_generic(self):
         """Base prompt should not hardcode one job family or vendor."""
@@ -314,10 +330,8 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
     async def test_generate_answer_empty_content_uses_fallback_model(self):
         """Provider responses with content=None should not leave the overlay blank."""
         client = MagicMock()
-        empty_response = MagicMock()
-        empty_response.text = None
-        fallback_response = MagicMock()
-        fallback_response.text = "Fallback after empty."
+        empty_response = GenerateContentResponse(None)
+        fallback_response = GenerateContentResponse("Fallback after empty.")
 
         client.models.generate_content.side_effect = [empty_response, fallback_response]
 
@@ -457,6 +471,34 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("__SKIP__", tokens)
 
+    async def test_stream_closed_when_generator_aclosed(self):
+        """Interruption: closing the generator must close the provider stream
+        (otherwise httpx cleans it up from a different task and raises)."""
+        chunks = self._make_stream_chunks(["Hello", " there", " friend"])
+        closed = []
+
+        class FakeStream:
+            def __aiter__(self_inner):
+                async def gen():
+                    for c in chunks:
+                        yield c
+                return gen()
+
+            async def aclose(self_inner):
+                closed.append(True)
+
+        self.llm.client = AsyncMock()
+        self.llm.client.chat.completions.create = AsyncMock(return_value=FakeStream())
+
+        agen = self.llm.generate_answer_stream(
+            ["[INTERVIEWER]: Tell me about yourself."], "context", question_type="behavioral"
+        )
+        async for _token in agen:
+            break  # consumer interrupts after the first token
+        await agen.aclose()  # what contextlib.aclosing() does in main.py
+
+        self.assertEqual(len(closed), 1)
+
     async def test_stream_no_api_key(self):
         """With no API key, stream should yield an error string."""
         self.llm.client = None
@@ -544,10 +586,8 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_empty_gemini_response_uses_gemini_fallback_model(self):
         """Empty Gemini streams should retry the same-provider fallback model."""
-        empty_chunk = MagicMock()
-        empty_chunk.text = None
-        fallback_chunk = MagicMock()
-        fallback_chunk.text = "Recovered"
+        empty_chunk = GenerateContentResponse(None)
+        fallback_chunk = GenerateContentResponse("Recovered")
 
         client = MagicMock()
         client.models.generate_content_stream.side_effect = [[empty_chunk], [fallback_chunk]]
@@ -569,6 +609,97 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
         calls = client.models.generate_content_stream.call_args_list
         self.assertEqual(calls[0].kwargs["model"], "gemini-2.5-flash")
         self.assertEqual(calls[1].kwargs["model"], "gemini-2.5-flash-lite")
+
+
+class TestSpokenPrompt(unittest.TestCase):
+    def test_spoken_mode_is_flowing_prose_with_no_bullet_scaffold(self):
+        os.environ["ANSWER_STYLE"] = "spoken"
+        try:
+            prompt = LLMClient()._answer_style_prompt()
+        finally:
+            os.environ.pop("ANSWER_STYLE", None)
+        lowered = prompt.lower()
+        self.assertNotIn("▸", prompt)   # the bullet glyph
+        self.assertNotIn("say:", lowered)
+        self.assertNotIn("close:", lowered)
+        # No leftover bullet scaffold glyphs (the prose explicitly tells the
+        # model NOT to use bullets, so the word "bullet" itself is expected).
+        self.assertNotIn("•", prompt)
+        self.assertIn("sentence", lowered)
+        self.assertIn("do not use bullet", lowered)
+
+    def test_standard_mode_returns_no_extra_shaping(self):
+        os.environ["ANSWER_STYLE"] = "standard"
+        try:
+            prompt = LLMClient()._answer_style_prompt()
+        finally:
+            os.environ.pop("ANSWER_STYLE", None)
+        self.assertEqual(prompt, "")
+
+
+class TestInterviewModePrompt(unittest.TestCase):
+    """INTERVIEW_MODE gates the heavy technical templates to save tokens."""
+
+    def test_default_mode_is_lean_without_heavy_technical_templates(self):
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("INTERVIEW_MODE", None)
+            with patch("core.llm.AsyncGroq"):
+                llm = LLMClient()
+        sp = llm.system_prompt
+        # Heavy, role-specific verbatim blocks are excluded by default.
+        self.assertNotIn("Security Group vs Network ACL", sp)
+        self.assertNotIn("sudo ss -tlnp", sp)
+        # Core guidance is retained.
+        self.assertIn("Match the target role", sp)
+        # Lean prompt is far smaller than the old ~11k-char prompt.
+        self.assertLess(len(sp), 6000)
+
+    def test_technical_mode_restores_technical_templates(self):
+        with patch.dict("os.environ", {"INTERVIEW_MODE": "technical"}, clear=False):
+            with patch("core.llm.AsyncGroq"):
+                llm = LLMClient()
+        sp = llm.system_prompt
+        self.assertIn("Security Group", sp)
+        self.assertIn("sudo ss -tlnp", sp)
+
+
+class TestProviderResponseParsing(unittest.TestCase):
+    """_response_text / _chunk_text must extract Groq/OpenAI content, not just Gemini.
+
+    Regression: a `text is None` guard (added for Gemini) short-circuited and
+    returned "" for every Groq response, so all answers came back empty.
+    """
+
+    def setUp(self):
+        with patch("core.llm.AsyncGroq"):
+            self.llm = LLMClient()
+
+    def _groq_chunk(self, content):
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
+
+    def _groq_response(self, content):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    def test_chunk_text_extracts_groq_delta_content(self):
+        self.assertEqual(self.llm._chunk_text(self._groq_chunk("Hello")), "Hello")
+
+    def test_response_text_extracts_groq_message_content(self):
+        self.assertEqual(self.llm._response_text(self._groq_response("Hello world")), "Hello world")
+
+    def test_chunk_text_returns_empty_for_groq_role_only_delta(self):
+        # First streamed chunk often carries role but no content — must be "" not crash.
+        chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))])
+        self.assertEqual(self.llm._chunk_text(chunk), "")
+
+    def test_gemini_text_attribute_still_used(self):
+        class GenerateContentResponse:
+            text = "gemini answer"
+        self.assertEqual(self.llm._response_text(GenerateContentResponse()), "gemini answer")
+
+    def test_gemini_empty_response_returns_empty(self):
+        class GenerateContentResponse:
+            text = None
+        self.assertEqual(self.llm._response_text(GenerateContentResponse()), "")
 
 
 if __name__ == "__main__":
