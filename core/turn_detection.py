@@ -30,6 +30,11 @@ AMBIGUOUS_PAUSE_SECONDS = 3.5
 # Safety valve: only force an answer on an unfinished sentence after a long
 # silence (never based on how long they have been talking).
 INCOMPLETE_FORCE_PAUSE_SECONDS = 6.0
+# How often to re-check the pause while interviewer text is pending. This is a
+# POLL interval, NOT a threshold: it must be smaller than the pause thresholds
+# so the loop fires right when the pause crosses one (e.g. ~2.5s), instead of
+# overshooting to ~5s when the first check lands a hair under the threshold.
+POLL_INTERVAL_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -99,12 +104,13 @@ def recommended_wait_timeout(text: str, previous_question: str = "") -> float:
     across successive polls.
     """
     if not text:
+        # No pending question yet — no need to spin; check occasionally.
         return AMBIGUOUS_PAUSE_SECONDS
     if is_short_followup(text, previous_question):
         return 0.4
-    if looks_complete(text):
-        return COMPLETE_PAUSE_SECONDS
-    return AMBIGUOUS_PAUSE_SECONDS
+    # Interviewer text is pending: poll finely so the pause is re-evaluated
+    # often and we answer right at the threshold, not at ~2x it.
+    return POLL_INTERVAL_SECONDS
 
 
 def decide_turn_action(text: str, pause: float, previous_question: str = "") -> TurnDecision:

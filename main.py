@@ -259,7 +259,14 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
         is_followup = is_followup_question(q_text, conversation_state["previous_question"])
 
         context = rag_manager.retrieve_context(q_text, conversation_history=transcript_history)
-        answer_clean = ""
+        # Instant opener so the chat path shows a starter line like the live path.
+        bridge_line = pick_bridge_line(q_text, is_followup)
+        ui_overlay.update_text(
+            bridge_line,
+            question_type=q_type if q_type else "generic",
+            is_streaming=True,
+        )
+        answer_clean = bridge_line + " "
         skipped = False
         batch_buffer = ""
         BATCH_CHARS = 8
@@ -283,8 +290,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
             answer_clean += token
             batch_buffer += token
             if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
+                # Raw text — update_text/format_structured_answer escapes it.
                 ui_overlay.update_text(
-                    answer_clean.replace('<', '&lt;').replace('>', '&gt;'),
+                    answer_clean,
                     question_type=q_type if q_type else "generic",
                     is_streaming=True
                 )
@@ -366,6 +374,9 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         )
                         answer_clean = answer.strip() if answer else ""
                         if answer_clean and not answer_clean.startswith("Error"):
+                            # Prepend the same natural opener as the auto path so the
+                            # starter line shows consistently on manual triggers too.
+                            answer_clean = f"{pick_bridge_line(q_text, is_followup)} {answer_clean}"
                             session_logger.info(f"[COPILOT ADVICE (MANUAL)]:\n{answer_clean}\n" + "="*50)
                             last_advice = answer_clean
                             transcript_history.append(f"[COPILOT]: {answer_clean}")
