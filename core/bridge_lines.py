@@ -66,6 +66,8 @@ _TECHNICAL_CUES = (
     "what is", "explain", "compare", "why use",
 )
 
+# Process-global, not thread-safe — fine for the single-threaded asyncio app with
+# one overlay. Tests reset this in setUp to stay order-independent.
 _last_line = None
 
 

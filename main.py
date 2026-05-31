@@ -656,9 +656,11 @@ async def process_transcripts(transcription_engine, rag_manager, llm_client, ui_
                         batch_buffer += token
                         # Update UI with raw text every ~8 chars or at sentence boundaries
                         if len(batch_buffer) >= BATCH_CHARS or token in ".!?\n":
-                            # Show raw text during streaming with question type
+                            # Pass raw text — update_text/format_structured_answer
+                            # html.escape()s it. Pre-escaping here double-escaped any
+                            # answer containing < or > (e.g. code, List<int>).
                             ui_overlay.update_text(
-                                answer_clean.replace('<','&lt;').replace('>','&gt;'),
+                                answer_clean,
                                 question_type=q_type if q_type else "generic",
                                 is_streaming=True
                             )
