@@ -367,42 +367,29 @@ For technical interviews, lead with the exact answer first, then add 2-4 precise
         )
 
     def _answer_style_prompt(self) -> str:
-        """Optional answer-shaping instructions for live spoken interviews."""
+        """Spoken-delivery shaping for live interviews — flowing prose, no bullets.
+
+        The app shows an instant thinking-bridge opener (see core/bridge_lines.py),
+        so the model goes straight into substance with no opener of its own.
+        """
         if self.answer_style not in {"spoken", "natural", "live"}:
             return ""
 
-        close_instruction = "Include a Close line." if self.answer_include_close else "Skip the Close line unless it is necessary."
-        return f"""
+        return """
 
 ---
 
 ## SPOKEN LIVE INTERVIEW MODE
-Format most answers for natural speech, not reading. The candidate should be able to start talking after reading only the first line.
+I am speaking these words out loud in a live interview, so they must sound like natural speech, not a written document.
 
-Use this structure unless the question explicitly asks for code:
-
-Opening:
-One short, natural bridge sentence I can say immediately while I organize the answer. Match the role and question type; for technical roles, keep it practical and specific rather than overly soft or scripted.
-
-Say:
-â–¸ {self.answer_max_bullets} or fewer short speakable bullets
-â–¸ Each bullet must be one sentence max
-â–¸ Use practical wording, not textbook wording
-â–¸ Prefer "I'd start by...", "I usually check...", "The tradeoff is..."
-
-Close:
-One optional sentence that sounds like a confident wrap-up or trade-off.
-
-Rules:
-- Do not produce long paragraphs.
-- Do not sound like a written article.
-- Do not include every possible detail; leave room for follow-up questions.
-- Use STAR internally for behavioral answers, but show labels only when they make the answer clearer.
-- Mention tools only when relevant and avoid claiming direct professional experience with a tool unless it appears in the context.
-- For troubleshooting, the first Say bullet should be the exact first command/check.
-- For architecture, cover only the highest-value components and one trade-off.
-- For behavioral questions, keep STAR but make each section one short spoken sentence.
-- {close_instruction}
+- Speak in first person with contractions ("I'd", "I've", "that's"). Confident, specific, practical.
+- Keep it to 3-4 flowing sentences. Lead with the actual answer, then one concrete proof point from my experience.
+- Do NOT use bullet points, numbered lists, markdown bold, headings, or STAR/section labels.
+- Do NOT open with a bridge or filler line — start directly on the substance (the app already supplied my opening words).
+- For technical questions, say the concrete answer or exact command first, then briefly why.
+- For behavioral questions, tell it as a short spoken story: the situation, what I did, and the result — woven together, not labelled.
+- Leave room for a follow-up; do not cram in every detail.
+- If the interviewer only said filler with no question, reply exactly with "SKIP".
 """
 
     def _has_technical_keyword(self, text_lower: str) -> bool:

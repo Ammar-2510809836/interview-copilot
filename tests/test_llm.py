@@ -3,6 +3,7 @@ Unit tests for core/llm.py — LLMClient model routing and mocked API calls.
 All Groq API calls are mocked — no real API key required to run these tests.
 """
 import asyncio
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
@@ -178,9 +179,12 @@ class TestModelRouter(unittest.TestCase):
     def test_spoken_answer_style_is_enabled_by_default(self):
         """Default prompt should be optimized for live spoken delivery."""
         self.assertIn("SPOKEN LIVE INTERVIEW MODE", self.llm.system_prompt)
-        self.assertIn("Opening:", self.llm.system_prompt)
-        self.assertIn("Say:", self.llm.system_prompt)
-        self.assertIn("Close:", self.llm.system_prompt)
+        # New flowing-prose shaping: no bullet/scaffold labels.
+        self.assertIn("flowing sentences", self.llm.system_prompt)
+        self.assertIn("Do NOT use bullet points", self.llm.system_prompt)
+        self.assertNotIn("Opening:", self.llm.system_prompt)
+        self.assertNotIn("Say:", self.llm.system_prompt)
+        self.assertNotIn("Close:", self.llm.system_prompt)
 
     def test_system_prompt_keeps_role_adaptation_generic(self):
         """Base prompt should not hardcode one job family or vendor."""
@@ -569,6 +573,32 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
         calls = client.models.generate_content_stream.call_args_list
         self.assertEqual(calls[0].kwargs["model"], "gemini-2.5-flash")
         self.assertEqual(calls[1].kwargs["model"], "gemini-2.5-flash-lite")
+
+
+class TestSpokenPrompt(unittest.TestCase):
+    def test_spoken_mode_is_flowing_prose_with_no_bullet_scaffold(self):
+        os.environ["ANSWER_STYLE"] = "spoken"
+        try:
+            prompt = LLMClient()._answer_style_prompt()
+        finally:
+            os.environ.pop("ANSWER_STYLE", None)
+        lowered = prompt.lower()
+        self.assertNotIn("▸", prompt)   # the bullet glyph
+        self.assertNotIn("say:", lowered)
+        self.assertNotIn("close:", lowered)
+        # No leftover bullet scaffold glyphs (the prose explicitly tells the
+        # model NOT to use bullets, so the word "bullet" itself is expected).
+        self.assertNotIn("•", prompt)
+        self.assertIn("sentence", lowered)
+        self.assertIn("do not use bullet", lowered)
+
+    def test_standard_mode_returns_no_extra_shaping(self):
+        os.environ["ANSWER_STYLE"] = "standard"
+        try:
+            prompt = LLMClient()._answer_style_prompt()
+        finally:
+            os.environ.pop("ANSWER_STYLE", None)
+        self.assertEqual(prompt, "")
 
 
 if __name__ == "__main__":
