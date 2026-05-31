@@ -638,7 +638,9 @@ I am speaking these words out loud in a live interview, so they must sound like 
         text = getattr(response, "text", None)
         if isinstance(text, str) and text:
             return str(text).strip()
-        if text is None or response.__class__.__name__ == "GenerateContentResponse":
+        # Gemini responses expose `.text`; an empty/None one means no content.
+        # Groq/OpenAI responses have no `.text` (None) — fall through to .choices.
+        if response.__class__.__name__ == "GenerateContentResponse":
             return ""
 
         try:
@@ -656,7 +658,9 @@ I am speaking these words out loud in a live interview, so they must sound like 
         text = getattr(chunk, "text", None)
         if isinstance(text, str) and text:
             return str(text)
-        if text is None or chunk.__class__.__name__ == "GenerateContentResponse":
+        # Gemini stream chunks expose `.text`; Groq/OpenAI chunks have no `.text`
+        # (None) and carry content in .choices[0].delta — fall through to it.
+        if chunk.__class__.__name__ == "GenerateContentResponse":
             return ""
 
         try:
@@ -945,7 +949,9 @@ I am speaking these words out loud in a live interview, so they must sound like 
                 stream=True,
             )
             async for chunk in stream:
-                if not chunk.choices:
+                # Skip Groq/OpenAI empty-choices chunks; Gemini chunks have no
+                # .choices and must fall through to _chunk_text (which reads .text).
+                if getattr(chunk, "choices", None) is not None and not chunk.choices:
                     continue
                 delta = self._chunk_text(chunk)
                 if delta:
@@ -1013,7 +1019,9 @@ I am speaking these words out loud in a live interview, so they must sound like 
                     stream=True,
                 )
                 async for chunk in self._stream_chunks(stream):
-                    if not chunk.choices:
+                    # Skip Groq/OpenAI empty-choices chunks; Gemini chunks have no
+                    # .choices and must fall through to _chunk_text (reads .text).
+                    if getattr(chunk, "choices", None) is not None and not chunk.choices:
                         continue
                     delta = self._chunk_text(chunk)
                     if delta:

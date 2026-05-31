@@ -5,11 +5,24 @@ All Groq API calls are mocked — no real API key required to run these tests.
 import asyncio
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 # chromadb must be imported before PyQt6 to avoid DLL conflicts on Windows
 import chromadb
 from core.llm import LLMClient
+
+
+class GenerateContentResponse:  # noqa: N801 - mirrors google-genai's real class name
+    """Faithful stand-in for a google-genai response/stream chunk.
+
+    Real Gemini objects expose `.text` (and have no `.choices`); the response
+    parser discriminates providers by this class name. Using a generic MagicMock
+    here would falsely expose `.choices`, so tests must use this shape.
+    """
+
+    def __init__(self, text):
+        self.text = text
 
 
 class TestModelRouter(unittest.TestCase):
@@ -317,10 +330,8 @@ class TestGenerateAnswerMocked(unittest.IsolatedAsyncioTestCase):
     async def test_generate_answer_empty_content_uses_fallback_model(self):
         """Provider responses with content=None should not leave the overlay blank."""
         client = MagicMock()
-        empty_response = MagicMock()
-        empty_response.text = None
-        fallback_response = MagicMock()
-        fallback_response.text = "Fallback after empty."
+        empty_response = GenerateContentResponse(None)
+        fallback_response = GenerateContentResponse("Fallback after empty.")
 
         client.models.generate_content.side_effect = [empty_response, fallback_response]
 
@@ -547,10 +558,8 @@ class TestGenerateAnswerStream(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_empty_gemini_response_uses_gemini_fallback_model(self):
         """Empty Gemini streams should retry the same-provider fallback model."""
-        empty_chunk = MagicMock()
-        empty_chunk.text = None
-        fallback_chunk = MagicMock()
-        fallback_chunk.text = "Recovered"
+        empty_chunk = GenerateContentResponse(None)
+        fallback_chunk = GenerateContentResponse("Recovered")
 
         client = MagicMock()
         client.models.generate_content_stream.side_effect = [[empty_chunk], [fallback_chunk]]
@@ -598,6 +607,45 @@ class TestSpokenPrompt(unittest.TestCase):
         finally:
             os.environ.pop("ANSWER_STYLE", None)
         self.assertEqual(prompt, "")
+
+
+class TestProviderResponseParsing(unittest.TestCase):
+    """_response_text / _chunk_text must extract Groq/OpenAI content, not just Gemini.
+
+    Regression: a `text is None` guard (added for Gemini) short-circuited and
+    returned "" for every Groq response, so all answers came back empty.
+    """
+
+    def setUp(self):
+        with patch("core.llm.AsyncGroq"):
+            self.llm = LLMClient()
+
+    def _groq_chunk(self, content):
+        return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
+
+    def _groq_response(self, content):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    def test_chunk_text_extracts_groq_delta_content(self):
+        self.assertEqual(self.llm._chunk_text(self._groq_chunk("Hello")), "Hello")
+
+    def test_response_text_extracts_groq_message_content(self):
+        self.assertEqual(self.llm._response_text(self._groq_response("Hello world")), "Hello world")
+
+    def test_chunk_text_returns_empty_for_groq_role_only_delta(self):
+        # First streamed chunk often carries role but no content — must be "" not crash.
+        chunk = SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))])
+        self.assertEqual(self.llm._chunk_text(chunk), "")
+
+    def test_gemini_text_attribute_still_used(self):
+        class GenerateContentResponse:
+            text = "gemini answer"
+        self.assertEqual(self.llm._response_text(GenerateContentResponse()), "gemini answer")
+
+    def test_gemini_empty_response_returns_empty(self):
+        class GenerateContentResponse:
+            text = None
+        self.assertEqual(self.llm._response_text(GenerateContentResponse()), "")
 
 
 if __name__ == "__main__":
